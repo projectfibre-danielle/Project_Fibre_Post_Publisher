@@ -889,7 +889,34 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   };
 
   const handleRichKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (!richRef.current) return;
+    const root = richRef.current;
+    if (!root) return;
+
+    const isLeafParagraphBlock = (el: HTMLElement): boolean => {
+      if (el === root || !root.contains(el)) return false;
+      if (el.closest('blockquote, ul, ol, pre')) return false;
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'p' || tag === 'h1' || tag === 'h2' || tag === 'h3') {
+        return true;
+      }
+      if (tag === 'div') {
+        return !el.querySelector(
+          'p, div, h1, h2, h3, ul, ol, blockquote, pre, hr, figure'
+        );
+      }
+      return false;
+    };
+
+    const findActiveLeafBlock = (node: Node | null): HTMLElement | null => {
+      let cur: Node | null = node;
+      while (cur && cur !== root) {
+        if (cur instanceof HTMLElement && isLeafParagraphBlock(cur)) {
+          return cur;
+        }
+        cur = cur.parentNode;
+      }
+      return null;
+    };
 
     // Reset paragraph first-line indent on Enter so next paragraph starts flush left
     if (
@@ -908,10 +935,9 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
 
       if (anchorEl?.closest('li, blockquote, pre')) return;
 
-      const currentBlock = anchorEl?.closest<HTMLElement>('p, h1, h2, h3');
+      const currentBlock = findActiveLeafBlock(anchorNode);
       if (
         !currentBlock ||
-        !richRef.current.contains(currentBlock) ||
         (!currentBlock.style.textIndent && !currentBlock.style.paddingLeft)
       ) {
         return;
@@ -992,7 +1018,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
     const li = anchorEl?.closest('li');
 
     // 1. Inside a list item: nest / outdent <li>
-    if (li && richRef.current.contains(li)) {
+    if (li && root.contains(li)) {
       const list = li.parentElement;
       if (!list) return;
       const listTag = list.tagName.toLowerCase();
@@ -1023,7 +1049,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
 
       // Shift+Tab inside <li>: outdent up one list level if nested
       const parentLi = list.parentElement?.closest('li');
-      if (!parentLi || !richRef.current.contains(parentLi)) {
+      if (!parentLi || !root.contains(parentLi)) {
         return;
       }
       const grandList = parentLi.parentElement;
@@ -1061,33 +1087,43 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
       return;
     }
 
-    // 2. Normal paragraph / heading block(s): first-line indent via style.textIndent (2em)
-    const blockSelector = 'p, h1, h2, h3';
-    const allBlocks = Array.from(
-      richRef.current.querySelectorAll<HTMLElement>(blockSelector)
-    ).filter((el) => !el.closest('blockquote, ul, ol'));
+    // 2. Normal paragraph / heading block(s): resolve active leaf block(s) dynamically
+    let targetBlocks: HTMLElement[] = [];
+    let resolvedRootChild: Node | null = null;
 
-    let targetBlocks = allBlocks.filter((block) => range.intersectsNode(block));
-
-    if (targetBlocks.length === 0) {
-      const closest = anchorEl?.closest<HTMLElement>(blockSelector);
-      if (closest && richRef.current.contains(closest) && !closest.closest('blockquote, ul, ol')) {
-        targetBlocks = [closest];
+    if (range.collapsed) {
+      let active: HTMLElement | null = findActiveLeafBlock(anchorNode);
+      if (!active && anchorNode === root && root.childNodes.length > 0) {
+        const idx = Math.min(range.startOffset, root.childNodes.length - 1);
+        const child = root.childNodes[idx] ?? root.childNodes[idx - 1] ?? null;
+        resolvedRootChild = child;
+        if (child instanceof HTMLElement && isLeafParagraphBlock(child)) {
+          active = child;
+        }
+      }
+      if (active) {
+        targetBlocks = [active];
+      }
+    } else {
+      const allLeafBlocks = Array.from(
+        root.querySelectorAll<HTMLElement>('p, div, h1, h2, h3')
+      ).filter(isLeafParagraphBlock);
+      targetBlocks = allLeafBlocks.filter((block) => range.intersectsNode(block));
+      if (targetBlocks.length === 0) {
+        const active = findActiveLeafBlock(anchorNode);
+        if (active) targetBlocks = [active];
       }
     }
 
-    // If editor is empty or caret sits on a bare text node directly under richRef
+    // Handle empty editor or unwrapped inline text nodes directly under root
     if (targetBlocks.length === 0) {
       if (e.shiftKey) return;
-      if (
-        richRef.current.innerHTML.trim() === '' ||
-        richRef.current.innerHTML === '<br>'
-      ) {
+      if (root.innerHTML.trim() === '' || root.innerHTML === '<br>') {
         const p = document.createElement('p');
         p.style.textIndent = '2em';
         p.appendChild(document.createElement('br'));
-        richRef.current.innerHTML = '';
-        richRef.current.appendChild(p);
+        root.innerHTML = '';
+        root.appendChild(p);
         const r = document.createRange();
         r.setStart(p, 0);
         r.collapse(true);
@@ -1096,14 +1132,55 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         syncRichToMarkdown();
         return;
       }
-      if (anchorNode.nodeType === Node.TEXT_NODE && anchorNode.parentNode === richRef.current) {
-        const p = document.createElement('p');
-        p.style.textIndent = '2em';
-        richRef.current.insertBefore(p, anchorNode);
-        p.appendChild(anchorNode);
-        restoreCaret();
-        syncRichToMarkdown();
-        return;
+
+      // Find top-level inline node directly under root and wrap its contiguous inline run in <p>
+      let topInline: Node | null =
+        anchorNode === root ? resolvedRootChild : anchorNode;
+      while (topInline && topInline !== root && topInline.parentNode !== root) {
+        topInline = topInline.parentNode;
+      }
+      if (topInline && topInline.parentNode === root) {
+        const blockTags = new Set([
+          'p',
+          'div',
+          'h1',
+          'h2',
+          'h3',
+          'ul',
+          'ol',
+          'blockquote',
+          'pre',
+          'hr',
+          'figure',
+          'br',
+        ]);
+        const isInlineRunNode = (n: Node) =>
+          n.nodeType === Node.TEXT_NODE ||
+          (n instanceof HTMLElement && !blockTags.has(n.tagName.toLowerCase()));
+
+        if (isInlineRunNode(topInline)) {
+          const runNodes: Node[] = [topInline];
+          let prev = topInline.previousSibling;
+          while (prev && isInlineRunNode(prev)) {
+            runNodes.unshift(prev);
+            prev = prev.previousSibling;
+          }
+          let next = topInline.nextSibling;
+          while (next && isInlineRunNode(next)) {
+            runNodes.push(next);
+            next = next.nextSibling;
+          }
+
+          const p = document.createElement('p');
+          p.style.textIndent = '2em';
+          root.insertBefore(p, runNodes[0]);
+          for (const n of runNodes) {
+            p.appendChild(n);
+          }
+          restoreCaret();
+          syncRichToMarkdown();
+          return;
+        }
       }
       return;
     }
@@ -1121,6 +1198,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
       }
     }
 
+    restoreCaret();
     syncRichToMarkdown();
   };
 
@@ -1645,6 +1723,13 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
             ref={richRef}
             contentEditable
             suppressContentEditableWarning
+            onFocus={() => {
+              try {
+                document.execCommand('defaultParagraphSeparator', false, 'p');
+              } catch {
+                // Ignore if unsupported by browser
+              }
+            }}
             onInput={syncRichToMarkdown}
             onBlur={syncRichToMarkdown}
             onKeyDown={handleRichKeyDown}

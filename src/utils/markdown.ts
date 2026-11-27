@@ -1730,8 +1730,8 @@ export function applyRawTabIndent(
     }
 
     // Otherwise scan backwards for an unclosed <div style="..."> or <p style="...">
-    const prefixText = value.slice(0, lineStart);
-    const tagRe = /<(div|p)\s+([^>]+)>|<\/(div|p)>/gi;
+    const prefixText = value.slice(0, selectionStart);
+    const tagRe = /<(div|p)(?:\s+([^>]+))?>|<\/(div|p)>/gi;
     const stack: Array<{
       tag: 'div' | 'p';
       openStart: number;
@@ -1745,7 +1745,7 @@ export function applyRawTabIndent(
           tag: m[1].toLowerCase() as 'div' | 'p',
           openStart: m.index,
           openEnd: tagRe.lastIndex,
-          attrs: m[2],
+          attrs: m[2] ?? '',
         });
       } else if (m[3]) {
         const closingTag = m[3].toLowerCase();
@@ -1758,21 +1758,24 @@ export function applyRawTabIndent(
       }
     }
 
-    if (stack.length === 0) return null;
-    const candidate = stack[stack.length - 1];
-    const closeTagRe = new RegExp(`</${candidate.tag}>`, 'i');
-    const afterOpen = value.slice(lineEnd);
-    const closeMatch = closeTagRe.exec(afterOpen);
-    if (!closeMatch) return null;
+    for (let s = stack.length - 1; s >= 0; s--) {
+      const candidate = stack[s];
+      if (!candidate.attrs) continue;
+      const closeTagRe = new RegExp(`</${candidate.tag}>`, 'i');
+      const afterSel = value.slice(selectionEnd);
+      const closeMatch = closeTagRe.exec(afterSel);
+      if (!closeMatch) continue;
+      return {
+        tag: candidate.tag,
+        openStart: candidate.openStart,
+        openEnd: candidate.openEnd,
+        attrs: candidate.attrs,
+        closeStart: selectionEnd + closeMatch.index,
+        closeEnd: selectionEnd + closeMatch.index + closeMatch[0].length,
+      };
+    }
 
-    return {
-      tag: candidate.tag,
-      openStart: candidate.openStart,
-      openEnd: candidate.openEnd,
-      attrs: candidate.attrs,
-      closeStart: lineEnd + closeMatch.index,
-      closeEnd: lineEnd + closeMatch.index + closeMatch[0].length,
-    };
+    return null;
   };
 
   const updateIndentInAttrs = (
@@ -1952,7 +1955,7 @@ export function applyRawEnterReset(
   selectionEnd: number
 ): { nextValue: string; nextStart: number; nextEnd: number; handled: boolean } {
   const prefixText = value.slice(0, selectionStart);
-  const tagRe = /<(div|p)\s+([^>]+)>|<\/(div|p)>/gi;
+  const tagRe = /<(div|p)(?:\s+([^>]+))?>|<\/(div|p)>/gi;
   const stack: Array<{
     tag: 'div' | 'p';
     openStart: number;
@@ -1967,7 +1970,7 @@ export function applyRawEnterReset(
         tag: m[1].toLowerCase() as 'div' | 'p',
         openStart: m.index,
         openEnd: tagRe.lastIndex,
-        attrs: m[2],
+        attrs: m[2] ?? '',
       });
     } else if (m[3]) {
       const closingTag = m[3].toLowerCase();
@@ -1985,6 +1988,9 @@ export function applyRawEnterReset(
   }
 
   const candidate = stack[stack.length - 1];
+  if (!candidate.attrs) {
+    return { nextValue: value, nextStart: selectionStart, nextEnd: selectionEnd, handled: false };
+  }
   const styles = extractBlockStylesFromTag(candidate.attrs);
   if (!styles.textIndent && !styles.paddingLeft) {
     return { nextValue: value, nextStart: selectionStart, nextEnd: selectionEnd, handled: false };
@@ -2026,13 +2032,9 @@ export function applyRawEnterReset(
     ? `${nextOpen}${afterTrimmed}${nextClose}`
     : `${nextOpen}${nextClose}`;
 
-  const suffix = trailingRest
-    ? `\n\n${trailingRest}`
-    : '';
-
+  const suffix = trailingRest ? `\n\n${trailingRest}` : '';
   const replacement = `${rawClose}${separator}${afterSection}${suffix}`;
-  const nextValue =
-    value.slice(0, candidate.openEnd) + replacement + value.slice(closeEnd + (value.slice(closeEnd).length - trailingRest.length));
+  const nextValue = value.slice(0, candidate.openEnd) + replacement;
 
   const caretOffset = candidate.openEnd + rawClose.length + separator.length + nextOpen.length;
   return {

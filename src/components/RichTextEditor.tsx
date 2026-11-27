@@ -30,6 +30,7 @@ import {
   Video,
 } from 'lucide-react';
 import {
+  applyRawEnterReset,
   applyRawMarkdownFormat,
   applyRawTabIndent,
   calculateReadingStats,
@@ -888,7 +889,80 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   };
 
   const handleRichKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (e.key !== 'Tab' || !richRef.current) return;
+    if (!richRef.current) return;
+
+    // Reset paragraph first-line indent on Enter so next paragraph starts flush left
+    if (
+      e.key === 'Enter' &&
+      !e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey
+    ) {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      const anchorNode = range.startContainer;
+      const anchorEl =
+        anchorNode instanceof Element ? anchorNode : anchorNode.parentElement;
+
+      if (anchorEl?.closest('li, blockquote, pre')) return;
+
+      const currentBlock = anchorEl?.closest<HTMLElement>('p, h1, h2, h3');
+      if (
+        !currentBlock ||
+        !richRef.current.contains(currentBlock) ||
+        (!currentBlock.style.textIndent && !currentBlock.style.paddingLeft)
+      ) {
+        return;
+      }
+
+      e.preventDefault();
+      if (!range.collapsed) {
+        range.deleteContents();
+      }
+
+      const afterRange = document.createRange();
+      afterRange.setStart(range.startContainer, range.startOffset);
+      afterRange.setEnd(currentBlock, currentBlock.childNodes.length);
+      const trailing = afterRange.extractContents();
+
+      if (
+        !currentBlock.textContent?.trim() &&
+        !currentBlock.querySelector('img, br')
+      ) {
+        currentBlock.appendChild(document.createElement('br'));
+      }
+
+      const nextP = document.createElement('p');
+      if (
+        currentBlock.style.textAlign === 'center' ||
+        currentBlock.style.textAlign === 'right'
+      ) {
+        nextP.style.textAlign = currentBlock.style.textAlign;
+      }
+
+      const hasMeaningfulTrailing =
+        Boolean(trailing.textContent?.trim()) ||
+        Boolean(trailing.querySelector('img'));
+      if (hasMeaningfulTrailing) {
+        nextP.appendChild(trailing);
+      } else {
+        nextP.appendChild(document.createElement('br'));
+      }
+
+      currentBlock.parentNode?.insertBefore(nextP, currentBlock.nextSibling);
+
+      const nextRange = document.createRange();
+      nextRange.setStart(nextP, 0);
+      nextRange.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(nextRange);
+      syncRichToMarkdown();
+      return;
+    }
+
+    if (e.key !== 'Tab') return;
     e.preventDefault();
 
     const sel = window.getSelection();
@@ -987,7 +1061,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
       return;
     }
 
-    // 2. Normal paragraph / heading block(s): indent/outdent via style.paddingLeft (2rem steps)
+    // 2. Normal paragraph / heading block(s): first-line indent via style.textIndent (2em)
     const blockSelector = 'p, h1, h2, h3';
     const allBlocks = Array.from(
       richRef.current.querySelectorAll<HTMLElement>(blockSelector)
@@ -1010,7 +1084,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         richRef.current.innerHTML === '<br>'
       ) {
         const p = document.createElement('p');
-        p.style.paddingLeft = '2rem';
+        p.style.textIndent = '2em';
         p.appendChild(document.createElement('br'));
         richRef.current.innerHTML = '';
         richRef.current.appendChild(p);
@@ -1024,7 +1098,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
       }
       if (anchorNode.nodeType === Node.TEXT_NODE && anchorNode.parentNode === richRef.current) {
         const p = document.createElement('p');
-        p.style.paddingLeft = '2rem';
+        p.style.textIndent = '2em';
         richRef.current.insertBefore(p, anchorNode);
         p.appendChild(anchorNode);
         restoreCaret();
@@ -1035,24 +1109,12 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
     }
 
     for (const block of targetBlocks) {
-      const currentRem = parseIndentRem(
-        block.style.paddingLeft || block.style.marginLeft || ''
-      );
       if (!e.shiftKey) {
-        const nextRem = Math.min(12, currentRem + 2);
-        block.style.paddingLeft = `${nextRem}rem`;
+        block.style.textIndent = '2em';
       } else {
-        if (currentRem > 0) {
-          const nextRem = Math.max(0, currentRem - 2);
-          if (nextRem > 0) {
-            block.style.paddingLeft = `${nextRem}rem`;
-          } else {
-            block.style.removeProperty('padding-left');
-            block.style.removeProperty('margin-left');
-          }
-        } else if (block.style.textIndent) {
-          block.style.removeProperty('text-indent');
-        }
+        block.style.removeProperty('text-indent');
+        block.style.removeProperty('padding-left');
+        block.style.removeProperty('margin-left');
         if (!block.getAttribute('style')?.trim()) {
           block.removeAttribute('style');
         }
@@ -1063,12 +1125,36 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   };
 
   const handleRawKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key !== 'Tab') return;
-    e.preventDefault();
-
     const textarea = rawRef.current;
     const start = textarea ? textarea.selectionStart : value.length;
     const end = textarea ? textarea.selectionEnd : value.length;
+
+    if (
+      e.key === 'Enter' &&
+      !e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey
+    ) {
+      const res = applyRawEnterReset(value, start, end);
+      if (!res.handled) return;
+      e.preventDefault();
+      if (res.nextValue !== value) {
+        lastEmittedRef.current = res.nextValue;
+        onChange(res.nextValue);
+      }
+      requestAnimationFrame(() => {
+        if (rawRef.current) {
+          rawRef.current.focus();
+          rawRef.current.setSelectionRange(res.nextStart, res.nextEnd);
+        }
+      });
+      return;
+    }
+
+    if (e.key !== 'Tab') return;
+    e.preventDefault();
+
     const res = applyRawTabIndent(value, start, end, e.shiftKey);
     if (!res.handled) return;
 

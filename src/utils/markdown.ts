@@ -1777,7 +1777,7 @@ export function applyRawTabIndent(
 
   const updateIndentInAttrs = (
     attrs: string,
-    deltaRem: number
+    applyIndent: boolean
   ): { nextTagAttrs: string | null; changed: boolean } => {
     const existingStyle = getAttr(attrs, 'style') ?? '';
     const decls: Array<[string, string]> = [];
@@ -1789,39 +1789,34 @@ export function applyRawTabIndent(
       if (prop && val) decls.push([prop, val]);
     }
 
-    const padIdx = decls.findIndex(
-      ([prop]) => prop === 'padding-left' || prop === 'margin-left'
-    );
     const indentIdx = decls.findIndex(([prop]) => prop === 'text-indent');
-    const currentRem = padIdx !== -1 ? parseIndentRem(decls[padIdx][1]) : 0;
+    let changed = false;
 
-    if (deltaRem > 0) {
-      const nextRem = Math.min(12, currentRem + deltaRem);
-      if (nextRem === currentRem) return { nextTagAttrs: attrs, changed: false };
-      if (padIdx !== -1) {
-        decls[padIdx] = ['padding-left', `${nextRem}rem`];
+    if (applyIndent) {
+      if (indentIdx !== -1) {
+        if (decls[indentIdx][1] !== '2em') {
+          decls[indentIdx] = ['text-indent', '2em'];
+          changed = true;
+        }
       } else {
-        decls.push(['padding-left', `${nextRem}rem`]);
+        decls.push(['text-indent', '2em']);
+        changed = true;
       }
     } else {
-      if (currentRem > 0) {
-        const nextRem = Math.max(0, currentRem + deltaRem);
-        if (nextRem > 0) {
-          decls[padIdx] = ['padding-left', `${nextRem}rem`];
-        } else {
-          decls.splice(padIdx, 1);
+      for (let idx = decls.length - 1; idx >= 0; idx--) {
+        const prop = decls[idx][0];
+        if (prop === 'text-indent' || prop === 'padding-left' || prop === 'margin-left') {
+          decls.splice(idx, 1);
+          changed = true;
         }
-      } else if (indentIdx !== -1) {
-        const currentTextIndent = parseIndentRem(decls[indentIdx][1]);
-        const nextTextIndent = Math.max(0, currentTextIndent + deltaRem);
-        if (nextTextIndent > 0) {
-          decls[indentIdx] = ['text-indent', `${nextTextIndent}em`];
-        } else {
-          decls.splice(indentIdx, 1);
-        }
-      } else {
+      }
+      if (!changed) {
         return { nextTagAttrs: attrs, changed: false };
       }
+    }
+
+    if (!changed) {
+      return { nextTagAttrs: attrs, changed: false };
     }
 
     const remainingAttrs = attrs
@@ -1844,8 +1839,7 @@ export function applyRawTabIndent(
 
   const wrapper = findEnclosingStyledWrapper();
   if (wrapper) {
-    const delta = isShift ? -2 : 2;
-    const { nextTagAttrs, changed } = updateIndentInAttrs(wrapper.attrs, delta);
+    const { nextTagAttrs, changed } = updateIndentInAttrs(wrapper.attrs, !isShift);
     if (!changed) {
       return {
         nextValue: value,
@@ -1932,7 +1926,7 @@ export function applyRawTabIndent(
   }
 
   const paraContent = value.slice(paraStart, paraEnd);
-  const openTag = '<div style="padding-left: 2rem;">\n\n';
+  const openTag = '<div style="text-indent: 2em">\n\n';
   const closeTag = '\n\n</div>';
 
   if (paraContent.trim() === '') {
@@ -1948,6 +1942,103 @@ export function applyRawTabIndent(
     nextValue,
     nextStart: selectionStart + openTag.length,
     nextEnd: selectionEnd + openTag.length,
+    handled: true,
+  };
+}
+
+export function applyRawEnterReset(
+  value: string,
+  selectionStart: number,
+  selectionEnd: number
+): { nextValue: string; nextStart: number; nextEnd: number; handled: boolean } {
+  const prefixText = value.slice(0, selectionStart);
+  const tagRe = /<(div|p)\s+([^>]+)>|<\/(div|p)>/gi;
+  const stack: Array<{
+    tag: 'div' | 'p';
+    openStart: number;
+    openEnd: number;
+    attrs: string;
+  }> = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = tagRe.exec(prefixText)) !== null) {
+    if (m[1]) {
+      stack.push({
+        tag: m[1].toLowerCase() as 'div' | 'p',
+        openStart: m.index,
+        openEnd: tagRe.lastIndex,
+        attrs: m[2],
+      });
+    } else if (m[3]) {
+      const closingTag = m[3].toLowerCase();
+      for (let s = stack.length - 1; s >= 0; s--) {
+        if (stack[s].tag === closingTag) {
+          stack.splice(s, 1);
+          break;
+        }
+      }
+    }
+  }
+
+  if (stack.length === 0) {
+    return { nextValue: value, nextStart: selectionStart, nextEnd: selectionEnd, handled: false };
+  }
+
+  const candidate = stack[stack.length - 1];
+  const styles = extractBlockStylesFromTag(candidate.attrs);
+  if (!styles.textIndent && !styles.paddingLeft) {
+    return { nextValue: value, nextStart: selectionStart, nextEnd: selectionEnd, handled: false };
+  }
+
+  const closeTagRe = new RegExp(`</${candidate.tag}>`, 'i');
+  const afterSel = value.slice(selectionEnd);
+  const closeMatch = closeTagRe.exec(afterSel);
+  if (!closeMatch) {
+    return { nextValue: value, nextStart: selectionStart, nextEnd: selectionEnd, handled: false };
+  }
+
+  const closeStart = selectionEnd + closeMatch.index;
+  const closeEnd = closeStart + closeMatch[0].length;
+  const beforeCaret = value.slice(candidate.openEnd, selectionStart);
+  const afterCaret = value.slice(selectionEnd, closeStart);
+
+  const rawClose =
+    candidate.tag === 'div'
+      ? `${beforeCaret.replace(/\s+$/, '')}\n\n</div>`
+      : `${beforeCaret.replace(/\s+$/, '')}</p>`;
+
+  const trailingRest = value.slice(closeEnd).replace(/^\n+/, '');
+  const nextStyleParts: string[] = [];
+  if (styles.align && styles.align !== 'left') {
+    nextStyleParts.push(`text-align: ${styles.align}`);
+  }
+  const hasRemainingWrapper = nextStyleParts.length > 0;
+  const nextOpen = hasRemainingWrapper
+    ? `<${candidate.tag} style="${nextStyleParts.join('; ')}">${candidate.tag === 'div' ? '\n\n' : ''}`
+    : '';
+  const nextClose = hasRemainingWrapper
+    ? `${candidate.tag === 'div' ? '\n\n' : ''}</${candidate.tag}>`
+    : '';
+
+  const afterTrimmed = afterCaret.trim();
+  const separator = '\n\n';
+  const afterSection = afterTrimmed
+    ? `${nextOpen}${afterTrimmed}${nextClose}`
+    : `${nextOpen}${nextClose}`;
+
+  const suffix = trailingRest
+    ? `\n\n${trailingRest}`
+    : '';
+
+  const replacement = `${rawClose}${separator}${afterSection}${suffix}`;
+  const nextValue =
+    value.slice(0, candidate.openEnd) + replacement + value.slice(closeEnd + (value.slice(closeEnd).length - trailingRest.length));
+
+  const caretOffset = candidate.openEnd + rawClose.length + separator.length + nextOpen.length;
+  return {
+    nextValue,
+    nextStart: caretOffset,
+    nextEnd: caretOffset,
     handled: true,
   };
 }

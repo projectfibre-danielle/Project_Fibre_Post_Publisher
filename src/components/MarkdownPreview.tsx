@@ -14,6 +14,7 @@ import {
   isAllowedIframeSrc,
   isSafeUrl,
   MarkdownBlock,
+  MarkdownListItem,
   parseMarkdownBlocks,
   TextAlign,
 } from '../utils/markdown';
@@ -176,6 +177,70 @@ function renderInlineTokens(
   });
 }
 
+function renderListBlock(
+  list: { type: 'ul' | 'ol'; items: MarkdownListItem[] },
+  key: React.Key,
+  depth = 0,
+  effectiveAlign?: TextAlign
+): React.ReactNode {
+  const alignmentCls = alignClass(effectiveAlign);
+  const isCenteredOrRight = Boolean(effectiveAlign && effectiveAlign !== 'left');
+
+  if (list.type === 'ul') {
+    const markerCls =
+      depth === 0
+        ? 'list-disc'
+        : depth === 1
+          ? 'list-[circle]'
+          : 'list-[square]';
+    const spacingCls =
+      depth === 0
+        ? `mb-4 space-y-1.5 text-[15.5px] leading-[1.7] text-[#27272A] ${
+            isCenteredOrRight ? `list-inside ${alignmentCls}` : 'pl-6'
+          }`
+        : `mt-1.5 space-y-1 ${isCenteredOrRight ? `list-inside ${alignmentCls}` : 'pl-6'}`;
+
+    return (
+      <ul key={key} className={`${markerCls} ${spacingCls}`}>
+        {list.items.map((item, itemIdx) => (
+          <li key={itemIdx}>
+            {renderInlineTokens(item.tokens)}
+            {item.children?.map((child, childIdx) =>
+              renderListBlock(child, childIdx, depth + 1, effectiveAlign)
+            )}
+          </li>
+        ))}
+      </ul>
+    );
+  }
+
+  const markerCls =
+    depth === 0
+      ? 'list-decimal'
+      : depth === 1
+        ? 'list-[lower-alpha]'
+        : 'list-[lower-roman]';
+  const spacingCls =
+    depth === 0
+      ? `mb-4 space-y-1.5 text-[15.5px] leading-[1.7] text-[#27272A] ${
+          isCenteredOrRight ? `list-inside ${alignmentCls}` : 'pl-6'
+        }`
+      : `mt-1.5 space-y-1 ${isCenteredOrRight ? `list-inside ${alignmentCls}` : 'pl-6'}`;
+
+  return (
+    <ol key={key} className={`${markerCls} ${spacingCls}`}>
+      {list.items.map((item, itemIdx) => (
+        <li key={itemIdx}>
+          {renderInlineTokens(item.tokens)}
+          {item.children?.map((child, childIdx) =>
+            renderListBlock(child, childIdx, depth + 1, effectiveAlign)
+          )}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
 function renderBlock(
   block: MarkdownBlock,
   index: number,
@@ -191,18 +256,30 @@ function renderBlock(
         <div
           key={index}
           className={alignClass(block.align)}
-          style={{ textAlign: block.align }}
+          style={{
+            ...(block.align ? { textAlign: block.align } : {}),
+            ...(block.paddingLeft ? { paddingLeft: block.paddingLeft } : {}),
+            ...(block.textIndent ? { textIndent: block.textIndent } : {}),
+          }}
         >
           {block.blocks.map((inner, innerIdx) =>
-            renderBlock(inner, innerIdx, block.align)
+            renderBlock(inner, innerIdx, block.align ?? inheritedAlign)
           )}
         </div>
       );
     case 'heading': {
+      const headingStyle: React.CSSProperties | undefined =
+        block.paddingLeft || block.textIndent
+          ? {
+              ...(block.paddingLeft ? { paddingLeft: block.paddingLeft } : {}),
+              ...(block.textIndent ? { textIndent: block.textIndent } : {}),
+            }
+          : undefined;
       if (block.level === 1) {
         return (
           <h2
             key={index}
+            style={headingStyle}
             className={`mt-8 mb-3 font-serif text-2xl font-semibold tracking-tight text-[#18181B] ${alignmentCls}`}
           >
             {renderInlineTokens(block.tokens)}
@@ -213,6 +290,7 @@ function renderBlock(
         return (
           <h3
             key={index}
+            style={headingStyle}
             className={`mt-7 mb-2.5 font-serif text-xl font-semibold tracking-tight text-[#18181B] ${alignmentCls}`}
           >
             {renderInlineTokens(block.tokens)}
@@ -222,21 +300,31 @@ function renderBlock(
       return (
         <h4
           key={index}
+          style={headingStyle}
           className={`mt-6 mb-2 font-serif text-lg font-semibold text-[#18181B] ${alignmentCls}`}
         >
           {renderInlineTokens(block.tokens)}
         </h4>
       );
     }
-    case 'paragraph':
+    case 'paragraph': {
+      const paraStyle: React.CSSProperties | undefined =
+        block.paddingLeft || block.textIndent
+          ? {
+              ...(block.paddingLeft ? { paddingLeft: block.paddingLeft } : {}),
+              ...(block.textIndent ? { textIndent: block.textIndent } : {}),
+            }
+          : undefined;
       return (
         <p
           key={index}
+          style={paraStyle}
           className={`mb-4 text-[15.5px] leading-[1.75] text-[#27272A] ${alignmentCls}`}
         >
           {renderInlineTokens(block.tokens)}
         </p>
       );
+    }
     case 'blockquote':
       return (
         <blockquote
@@ -305,35 +393,8 @@ function renderBlock(
       );
     }
     case 'ul':
-      return (
-        <ul
-          key={index}
-          className={`mb-4 list-disc space-y-1.5 text-[15.5px] leading-[1.7] text-[#27272A] ${
-            effectiveAlign && effectiveAlign !== 'left'
-              ? `list-inside ${alignmentCls}`
-              : 'pl-6'
-          }`}
-        >
-          {block.items.map((item, itemIdx) => (
-            <li key={itemIdx}>{renderInlineTokens(item)}</li>
-          ))}
-        </ul>
-      );
     case 'ol':
-      return (
-        <ol
-          key={index}
-          className={`mb-4 list-decimal space-y-1.5 text-[15.5px] leading-[1.7] text-[#27272A] ${
-            effectiveAlign && effectiveAlign !== 'left'
-              ? `list-inside ${alignmentCls}`
-              : 'pl-6'
-          }`}
-        >
-          {block.items.map((item, itemIdx) => (
-            <li key={itemIdx}>{renderInlineTokens(item)}</li>
-          ))}
-        </ol>
-      );
+      return renderListBlock(block, index, 0, effectiveAlign);
     case 'codeblock':
       return (
         <pre

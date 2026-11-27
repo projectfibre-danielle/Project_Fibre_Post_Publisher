@@ -31,12 +31,14 @@ import {
 } from 'lucide-react';
 import {
   applyRawMarkdownFormat,
+  applyRawTabIndent,
   calculateReadingStats,
   domToMarkdown,
   FormatAction,
   isSafeHexColor,
   isSafeUrl,
   markdownToSafeHtml,
+  parseIndentRem,
   PRESET_TEXT_COLORS,
   resolveVideoEmbed,
 } from '../utils/markdown';
@@ -116,6 +118,22 @@ function sanitizePastedHtml(html: string): string {
       if (!isSafeUrl(src)) return null;
       cleanEl.setAttribute('src', src);
       cleanEl.setAttribute('alt', alt);
+    }
+    if (tag === 'blockquote') {
+      const callout = el.getAttribute('data-callout');
+      if (callout) cleanEl.setAttribute('data-callout', callout);
+    }
+    if (tag === 'p' || tag === 'div') {
+      const pad = el.style?.paddingLeft;
+      const textIndent = el.style?.textIndent;
+      const align = el.style?.textAlign;
+      if (pad && parseIndentRem(pad) > 0) cleanEl.style.paddingLeft = pad;
+      if (textIndent && parseIndentRem(textIndent) > 0) {
+        cleanEl.style.textIndent = textIndent;
+      }
+      if (align === 'left' || align === 'center' || align === 'right') {
+        cleanEl.style.textAlign = align;
+      }
     }
 
     for (const child of Array.from(el.childNodes)) {
@@ -869,6 +887,204 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
     }
   };
 
+  const handleRichKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'Tab' || !richRef.current) return;
+    e.preventDefault();
+
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+
+    const range = sel.getRangeAt(0);
+    const savedStartContainer = range.startContainer;
+    const savedStartOffset = range.startOffset;
+    const savedEndContainer = range.endContainer;
+    const savedEndOffset = range.endOffset;
+
+    const restoreCaret = () => {
+      try {
+        const nextRange = document.createRange();
+        nextRange.setStart(savedStartContainer, savedStartOffset);
+        nextRange.setEnd(savedEndContainer, savedEndOffset);
+        sel.removeAllRanges();
+        sel.addRange(nextRange);
+      } catch {
+        // Fallback if node references shifted
+      }
+    };
+
+    const anchorNode = range.startContainer;
+    const anchorEl =
+      anchorNode instanceof Element ? anchorNode : anchorNode.parentElement;
+    const li = anchorEl?.closest('li');
+
+    // 1. Inside a list item: nest / outdent <li>
+    if (li && richRef.current.contains(li)) {
+      const list = li.parentElement;
+      if (!list) return;
+      const listTag = list.tagName.toLowerCase();
+      if (listTag !== 'ul' && listTag !== 'ol') return;
+
+      if (!e.shiftKey) {
+        const prevLi = li.previousElementSibling;
+        if (!prevLi || prevLi.tagName.toLowerCase() !== 'li') {
+          return;
+        }
+        const lastChild = prevLi.lastElementChild;
+        let subList: Element;
+        if (
+          lastChild &&
+          (lastChild.tagName.toLowerCase() === 'ul' ||
+            lastChild.tagName.toLowerCase() === 'ol')
+        ) {
+          subList = lastChild;
+        } else {
+          subList = document.createElement(listTag);
+          prevLi.appendChild(subList);
+        }
+        subList.appendChild(li);
+        restoreCaret();
+        syncRichToMarkdown();
+        return;
+      }
+
+      // Shift+Tab inside <li>: outdent up one list level if nested
+      const parentLi = list.parentElement?.closest('li');
+      if (!parentLi || !richRef.current.contains(parentLi)) {
+        return;
+      }
+      const grandList = parentLi.parentElement;
+      if (!grandList) return;
+
+      const followingSiblings: Element[] = [];
+      let nextEl = li.nextElementSibling;
+      while (nextEl) {
+        followingSiblings.push(nextEl);
+        nextEl = nextEl.nextElementSibling;
+      }
+
+      grandList.insertBefore(li, parentLi.nextSibling);
+
+      if (followingSiblings.length > 0) {
+        const existingChildList = Array.from(li.children).find(
+          (c) =>
+            c.tagName.toLowerCase() === 'ul' || c.tagName.toLowerCase() === 'ol'
+        );
+        const childSubList =
+          existingChildList ?? document.createElement(listTag);
+        for (const sib of followingSiblings) {
+          childSubList.appendChild(sib);
+        }
+        if (!existingChildList) {
+          li.appendChild(childSubList);
+        }
+      }
+
+      if (list.children.length === 0) {
+        list.remove();
+      }
+      restoreCaret();
+      syncRichToMarkdown();
+      return;
+    }
+
+    // 2. Normal paragraph / heading block(s): indent/outdent via style.paddingLeft (2rem steps)
+    const blockSelector = 'p, h1, h2, h3';
+    const allBlocks = Array.from(
+      richRef.current.querySelectorAll<HTMLElement>(blockSelector)
+    ).filter((el) => !el.closest('blockquote, ul, ol'));
+
+    let targetBlocks = allBlocks.filter((block) => range.intersectsNode(block));
+
+    if (targetBlocks.length === 0) {
+      const closest = anchorEl?.closest<HTMLElement>(blockSelector);
+      if (closest && richRef.current.contains(closest) && !closest.closest('blockquote, ul, ol')) {
+        targetBlocks = [closest];
+      }
+    }
+
+    // If editor is empty or caret sits on a bare text node directly under richRef
+    if (targetBlocks.length === 0) {
+      if (e.shiftKey) return;
+      if (
+        richRef.current.innerHTML.trim() === '' ||
+        richRef.current.innerHTML === '<br>'
+      ) {
+        const p = document.createElement('p');
+        p.style.paddingLeft = '2rem';
+        p.appendChild(document.createElement('br'));
+        richRef.current.innerHTML = '';
+        richRef.current.appendChild(p);
+        const r = document.createRange();
+        r.setStart(p, 0);
+        r.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(r);
+        syncRichToMarkdown();
+        return;
+      }
+      if (anchorNode.nodeType === Node.TEXT_NODE && anchorNode.parentNode === richRef.current) {
+        const p = document.createElement('p');
+        p.style.paddingLeft = '2rem';
+        richRef.current.insertBefore(p, anchorNode);
+        p.appendChild(anchorNode);
+        restoreCaret();
+        syncRichToMarkdown();
+        return;
+      }
+      return;
+    }
+
+    for (const block of targetBlocks) {
+      const currentRem = parseIndentRem(
+        block.style.paddingLeft || block.style.marginLeft || ''
+      );
+      if (!e.shiftKey) {
+        const nextRem = Math.min(12, currentRem + 2);
+        block.style.paddingLeft = `${nextRem}rem`;
+      } else {
+        if (currentRem > 0) {
+          const nextRem = Math.max(0, currentRem - 2);
+          if (nextRem > 0) {
+            block.style.paddingLeft = `${nextRem}rem`;
+          } else {
+            block.style.removeProperty('padding-left');
+            block.style.removeProperty('margin-left');
+          }
+        } else if (block.style.textIndent) {
+          block.style.removeProperty('text-indent');
+        }
+        if (!block.getAttribute('style')?.trim()) {
+          block.removeAttribute('style');
+        }
+      }
+    }
+
+    syncRichToMarkdown();
+  };
+
+  const handleRawKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== 'Tab') return;
+    e.preventDefault();
+
+    const textarea = rawRef.current;
+    const start = textarea ? textarea.selectionStart : value.length;
+    const end = textarea ? textarea.selectionEnd : value.length;
+    const res = applyRawTabIndent(value, start, end, e.shiftKey);
+    if (!res.handled) return;
+
+    if (res.nextValue !== value) {
+      lastEmittedRef.current = res.nextValue;
+      onChange(res.nextValue);
+    }
+
+    requestAnimationFrame(() => {
+      if (rawRef.current) {
+        rawRef.current.focus();
+        rawRef.current.setSelectionRange(res.nextStart, res.nextEnd);
+      }
+    });
+  };
+
   const stats = calculateReadingStats(value);
   const isHexValid = isSafeHexColor(
     hexInput.trim().startsWith('#') ? hexInput.trim() : `#${hexInput.trim()}`
@@ -1345,6 +1561,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
             suppressContentEditableWarning
             onInput={syncRichToMarkdown}
             onBlur={syncRichToMarkdown}
+            onKeyDown={handleRichKeyDown}
             onPaste={handleRichPaste}
             data-placeholder="Write your Project Fibre story here. Use the sticky toolbar above for headings, underline, alignment, colors, media, and math — everything converts cleanly to Markdown..."
             className="rich-editor-surface min-h-full text-[15.5px] leading-[1.75] text-[#18181B] focus:outline-none"
@@ -1353,6 +1570,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
           <textarea
             ref={rawRef}
             value={value}
+            onKeyDown={handleRawKeyDown}
             onChange={(e) => {
               lastEmittedRef.current = e.target.value;
               onChange(e.target.value);

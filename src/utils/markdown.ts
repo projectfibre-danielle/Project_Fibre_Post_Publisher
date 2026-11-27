@@ -59,13 +59,34 @@ export interface InlineToken {
   children?: InlineToken[];
 }
 
+export interface MarkdownListItem {
+  tokens: InlineToken[];
+  children?: Array<
+    | { type: 'ul'; items: MarkdownListItem[] }
+    | { type: 'ol'; items: MarkdownListItem[] }
+  >;
+}
+
 export type MarkdownBlock =
-  | { type: 'heading'; level: 1 | 2 | 3; tokens: InlineToken[]; align?: TextAlign }
-  | { type: 'paragraph'; tokens: InlineToken[]; align?: TextAlign }
+  | {
+      type: 'heading';
+      level: 1 | 2 | 3;
+      tokens: InlineToken[];
+      align?: TextAlign;
+      paddingLeft?: string;
+      textIndent?: string;
+    }
+  | {
+      type: 'paragraph';
+      tokens: InlineToken[];
+      align?: TextAlign;
+      paddingLeft?: string;
+      textIndent?: string;
+    }
   | { type: 'blockquote'; lines: InlineToken[][] }
   | { type: 'callout'; kind: CalloutKind; lines: InlineToken[][] }
-  | { type: 'ul'; items: InlineToken[][] }
-  | { type: 'ol'; items: InlineToken[][] }
+  | { type: 'ul'; items: MarkdownListItem[] }
+  | { type: 'ol'; items: MarkdownListItem[] }
   | { type: 'codeblock'; lang: string; code: string }
   | { type: 'math_block'; formula: string }
   | { type: 'image'; src: string; alt: string; align?: TextAlign }
@@ -76,7 +97,13 @@ export type MarkdownBlock =
       title: string;
       align?: TextAlign;
     }
-  | { type: 'aligned'; align: TextAlign; blocks: MarkdownBlock[] }
+  | {
+      type: 'aligned';
+      align?: TextAlign;
+      paddingLeft?: string;
+      textIndent?: string;
+      blocks: MarkdownBlock[];
+    }
   | { type: 'hr' };
 
 function escapeHtml(text: string): string {
@@ -417,6 +444,107 @@ function extractAlignFromTag(openTagAttrs: string): TextAlign | null {
   return null;
 }
 
+export function isSafeCssLength(value: string): boolean {
+  const trimmed = value.trim();
+  const match = /^(\d+(?:\.\d+)?)(rem|em|px)$/i.exec(trimmed);
+  if (!match) return false;
+  return Number(match[1]) > 0;
+}
+
+export function parseIndentRem(value: string): number {
+  const trimmed = value.trim();
+  const match = /^(\d+(?:\.\d+)?)(rem|em|px)$/i.exec(trimmed);
+  if (!match) return 0;
+  const num = Number(match[1]);
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  const unit = match[2].toLowerCase();
+  if (unit === 'px') return Math.round((num / 16) * 100) / 100;
+  return num;
+}
+
+function extractBlockStylesFromTag(openTagAttrs: string): {
+  align?: TextAlign;
+  paddingLeft?: string;
+  textIndent?: string;
+} {
+  const style = getAttr(openTagAttrs, 'style') ?? '';
+  const align = extractAlignFromTag(openTagAttrs) ?? undefined;
+  const padMatch = /padding-left\s*:\s*([^;]+)/i.exec(style);
+  const marginMatch = /margin-left\s*:\s*([^;]+)/i.exec(style);
+  const indentMatch = /text-indent\s*:\s*([^;]+)/i.exec(style);
+
+  const rawPad = padMatch?.[1]?.trim() || marginMatch?.[1]?.trim() || '';
+  const rawIndent = indentMatch?.[1]?.trim() || '';
+
+  return {
+    ...(align ? { align } : {}),
+    ...(rawPad && isSafeCssLength(rawPad) ? { paddingLeft: rawPad } : {}),
+    ...(rawIndent && isSafeCssLength(rawIndent) ? { textIndent: rawIndent } : {}),
+  };
+}
+
+function measureLeadingIndent(line: string): number {
+  let count = 0;
+  for (const ch of line) {
+    if (ch === ' ') count += 1;
+    else if (ch === '\t') count += 2;
+    else break;
+  }
+  return count;
+}
+
+function parseListBlock(
+  lines: string[],
+  startIdx: number
+): {
+  block: { type: 'ul' | 'ol'; items: MarkdownListItem[] };
+  nextIdx: number;
+} {
+  const listLineRe = /^(?: *|\t*)(?:([-*+])|(\d+)\.)\s+(.*)$/;
+  const firstMatch = listLineRe.exec(lines[startIdx]);
+  const baseIndent = measureLeadingIndent(lines[startIdx]);
+  const listType: 'ul' | 'ol' = firstMatch?.[1] ? 'ul' : 'ol';
+  const items: MarkdownListItem[] = [];
+  let i = startIdx;
+
+  while (i < lines.length) {
+    const match = listLineRe.exec(lines[i]);
+    if (!match) break;
+
+    const indent = measureLeadingIndent(lines[i]);
+    const itemType: 'ul' | 'ol' = match[1] ? 'ul' : 'ol';
+    const content = match[3] ?? '';
+
+    if (indent < baseIndent) {
+      break;
+    }
+
+    if (indent > baseIndent) {
+      if (items.length > 0) {
+        const sub = parseListBlock(lines, i);
+        const lastItem = items[items.length - 1];
+        if (!lastItem.children) lastItem.children = [];
+        lastItem.children.push(sub.block);
+        i = sub.nextIdx;
+        continue;
+      }
+      // List starts already indented without a parent item
+      items.push({ tokens: parseInlineMarkdown(content.trim()) });
+      i++;
+      continue;
+    }
+
+    if (itemType !== listType) {
+      break;
+    }
+
+    items.push({ tokens: parseInlineMarkdown(content.trim()) });
+    i++;
+  }
+
+  return { block: { type: listType, items }, nextIdx: i };
+}
+
 function findMatchingClosingTag(
   lines: string[],
   startLineIdx: number,
@@ -553,21 +681,27 @@ export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
       continue;
     }
 
-    // Aligned wrapper <div style="text-align: ..."> or <div align="..."> or <p style="text-align: ...">
-    const alignedOpenMatch = /^<(div|p)\s+([^>]+)>(.*)$/i.exec(trimmed);
-    if (alignedOpenMatch) {
-      const tagName = alignedOpenMatch[1].toLowerCase() as 'div' | 'p';
-      const align = extractAlignFromTag(alignedOpenMatch[2]);
-      if (align) {
+    // Styled wrapper <div style="text-align: ...; padding-left: ..."> or <p style="...">
+    const styledOpenMatch = /^<(div|p)\s+([^>]+)>(.*)$/i.exec(trimmed);
+    if (styledOpenMatch) {
+      const tagName = styledOpenMatch[1].toLowerCase() as 'div' | 'p';
+      const styles = extractBlockStylesFromTag(styledOpenMatch[2]);
+      if (styles.align || styles.paddingLeft || styles.textIndent) {
         const { innerMarkdown, endLineIdx } = findMatchingClosingTag(
           lines,
           i,
           tagName,
-          alignedOpenMatch[3] ?? ''
+          styledOpenMatch[3] ?? ''
         );
         const innerBlocks = parseMarkdownBlocks(innerMarkdown);
         if (innerBlocks.length > 0) {
-          blocks.push({ type: 'aligned', align, blocks: innerBlocks });
+          blocks.push({
+            type: 'aligned',
+            ...(styles.align ? { align: styles.align } : {}),
+            ...(styles.paddingLeft ? { paddingLeft: styles.paddingLeft } : {}),
+            ...(styles.textIndent ? { textIndent: styles.textIndent } : {}),
+            blocks: innerBlocks,
+          });
         }
         i = endLineIdx + 1;
         continue;
@@ -669,27 +803,11 @@ export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
       continue;
     }
 
-    // Unordered list
-    if (/^[-*+]\s+/.test(trimmed)) {
-      const items: InlineToken[][] = [];
-      while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
-        const content = lines[i].trim().replace(/^[-*+]\s+/, '');
-        items.push(parseInlineMarkdown(content));
-        i++;
-      }
-      blocks.push({ type: 'ul', items });
-      continue;
-    }
-
-    // Ordered list
-    if (/^\d+\.\s+/.test(trimmed)) {
-      const items: InlineToken[][] = [];
-      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
-        const content = lines[i].trim().replace(/^\d+\.\s+/, '');
-        items.push(parseInlineMarkdown(content));
-        i++;
-      }
-      blocks.push({ type: 'ol', items });
+    // Unordered or ordered list (with nested indentation support)
+    if (/^(?:[-*+]|\d+\.)\s+/.test(trimmed)) {
+      const { block, nextIdx } = parseListBlock(lines, i);
+      blocks.push(block);
+      i = nextIdx;
       continue;
     }
 
@@ -754,40 +872,70 @@ function inlineTokensToHtml(tokens: InlineToken[]): string {
     .join('');
 }
 
-function blocksToHtml(blocks: MarkdownBlock[], align?: TextAlign): string {
-  const alignAttr = align ? ` style="text-align: ${align}"` : '';
+interface BlockHtmlStyleContext {
+  align?: TextAlign;
+  paddingLeft?: string;
+  textIndent?: string;
+}
+
+function buildStyleAttr(ctx?: BlockHtmlStyleContext): string {
+  if (!ctx) return '';
+  const parts: string[] = [];
+  if (ctx.align) parts.push(`text-align: ${ctx.align}`);
+  if (ctx.paddingLeft) parts.push(`padding-left: ${ctx.paddingLeft}`);
+  if (ctx.textIndent) parts.push(`text-indent: ${ctx.textIndent}`);
+  return parts.length > 0 ? ` style="${parts.join('; ')}"` : '';
+}
+
+function listItemsToHtml(items: MarkdownListItem[]): string {
+  return items
+    .map((item) => {
+      const textHtml = inlineTokensToHtml(item.tokens);
+      const childrenHtml = (item.children ?? [])
+        .map((child) =>
+          child.type === 'ul'
+            ? `<ul>${listItemsToHtml(child.items)}</ul>`
+            : `<ol>${listItemsToHtml(child.items)}</ol>`
+        )
+        .join('');
+      return `<li>${textHtml}${childrenHtml}</li>`;
+    })
+    .join('');
+}
+
+function blocksToHtml(
+  blocks: MarkdownBlock[],
+  styleCtx?: BlockHtmlStyleContext
+): string {
+  const styleAttr = buildStyleAttr(styleCtx);
   return blocks
     .map((block) => {
       switch (block.type) {
         case 'heading':
-          return `<h${block.level}${alignAttr}>${inlineTokensToHtml(block.tokens)}</h${block.level}>`;
+          return `<h${block.level}${styleAttr}>${inlineTokensToHtml(block.tokens)}</h${block.level}>`;
         case 'paragraph':
-          return `<p${alignAttr}>${inlineTokensToHtml(block.tokens)}</p>`;
+          return `<p${styleAttr}>${inlineTokensToHtml(block.tokens)}</p>`;
         case 'blockquote':
-          return `<blockquote${alignAttr}>${block.lines
+          return `<blockquote${styleAttr}>${block.lines
             .map((line) => `<p>${inlineTokensToHtml(line)}</p>`)
             .join('')}</blockquote>`;
         case 'callout':
-          return `<blockquote data-callout="${block.kind}"${alignAttr}>${block.lines
+          return `<blockquote data-callout="${block.kind}"${styleAttr}>${block.lines
             .map((line) => `<p>${inlineTokensToHtml(line)}</p>`)
             .join('')}</blockquote>`;
         case 'ul':
-          return `<ul${alignAttr}>${block.items
-            .map((item) => `<li>${inlineTokensToHtml(item)}</li>`)
-            .join('')}</ul>`;
+          return `<ul${styleAttr}>${listItemsToHtml(block.items)}</ul>`;
         case 'ol':
-          return `<ol${alignAttr}>${block.items
-            .map((item) => `<li>${inlineTokensToHtml(item)}</li>`)
-            .join('')}</ol>`;
+          return `<ol${styleAttr}>${listItemsToHtml(block.items)}</ol>`;
         case 'codeblock':
           return `<pre><code>${escapeHtml(block.code)}</code></pre>`;
         case 'math_block':
-          return `<p${alignAttr}>$$${escapeHtml(block.formula)}$$</p>`;
+          return `<p${styleAttr}>$$${escapeHtml(block.formula)}$$</p>`;
         case 'image': {
           const safeSrc = isSafeUrl(block.src) ? escapeHtml(block.src) : '';
           const safeAlt = escapeHtml(block.alt);
           return safeSrc
-            ? `<p${alignAttr}><img src="${safeSrc}" alt="${safeAlt}" /></p>`
+            ? `<p${styleAttr}><img src="${safeSrc}" alt="${safeAlt}" /></p>`
             : '';
         }
         case 'video': {
@@ -796,7 +944,11 @@ function blocksToHtml(blocks: MarkdownBlock[], align?: TextAlign): string {
           return `<figure data-video-embed="true" data-video-kind="${block.kind}" data-video-src="${safeSrc}" data-video-title="${safeTitle}" contenteditable="false"><span>Video: ${safeTitle}</span><span style="color: #71717A; font-family: monospace; font-size: 11px;">${safeSrc}</span></figure>`;
         }
         case 'aligned':
-          return blocksToHtml(block.blocks, block.align);
+          return blocksToHtml(block.blocks, {
+            align: block.align ?? styleCtx?.align,
+            paddingLeft: block.paddingLeft ?? styleCtx?.paddingLeft,
+            textIndent: block.textIndent ?? styleCtx?.textIndent,
+          });
         case 'hr':
           return '<hr />';
       }
@@ -910,10 +1062,93 @@ function getElementAlign(el: HTMLElement): TextAlign | null {
   return null;
 }
 
-function wrapAlignedMarkdown(align: TextAlign | null, content: string): string {
+function getElementPaddingLeft(el: HTMLElement): string | null {
+  const raw = (el.style?.paddingLeft || el.style?.marginLeft || '').trim();
+  if (!raw || !isSafeCssLength(raw)) return null;
+  if (/px$/i.test(raw)) {
+    const rem = parseIndentRem(raw);
+    return rem > 0 ? `${rem}rem` : null;
+  }
+  return raw;
+}
+
+function getElementTextIndent(el: HTMLElement): string | null {
+  const raw = (el.style?.textIndent || '').trim();
+  if (!raw || !isSafeCssLength(raw)) return null;
+  return raw;
+}
+
+function wrapStyledMarkdown(
+  styles: {
+    align?: TextAlign | null;
+    paddingLeft?: string | null;
+    textIndent?: string | null;
+  },
+  content: string
+): string {
   if (!content) return '';
-  if (!align || align === 'left') return content;
-  return `<div style="text-align: ${align}">\n\n${content}\n\n</div>`;
+  const parts: string[] = [];
+  if (styles.align && styles.align !== 'left') {
+    parts.push(`text-align: ${styles.align}`);
+  }
+  if (styles.paddingLeft) {
+    parts.push(`padding-left: ${styles.paddingLeft}`);
+  }
+  if (styles.textIndent) {
+    parts.push(`text-indent: ${styles.textIndent}`);
+  }
+  if (parts.length === 0) return content;
+  return `<div style="${parts.join('; ')}">\n\n${content}\n\n</div>`;
+}
+
+function serializeListNode(listEl: HTMLElement, depth = 0): string {
+  const tag = listEl.tagName.toLowerCase();
+  const isOrdered = tag === 'ol';
+  const indent = '  '.repeat(depth);
+  const lines: string[] = [];
+  let itemIndex = 0;
+
+  for (const child of Array.from(listEl.children)) {
+    const childTag = child.tagName.toLowerCase();
+    if (childTag === 'ul' || childTag === 'ol') {
+      const nested = serializeListNode(child as HTMLElement, depth + 1);
+      if (nested) lines.push(nested);
+      continue;
+    }
+    if (childTag !== 'li') continue;
+
+    itemIndex += 1;
+    const inlineNodes: Node[] = [];
+    const nestedLists: HTMLElement[] = [];
+
+    for (const liChild of Array.from(child.childNodes)) {
+      if (liChild.nodeType === Node.ELEMENT_NODE) {
+        const subTag = (liChild as HTMLElement).tagName.toLowerCase();
+        if (subTag === 'ul' || subTag === 'ol') {
+          nestedLists.push(liChild as HTMLElement);
+          continue;
+        }
+      }
+      inlineNodes.push(liChild);
+    }
+
+    const text = inlineNodes
+      .map((c, idx) => serializeInlineNode(c, idx === inlineNodes.length - 1))
+      .join('')
+      .trim();
+
+    if (text) {
+      const prefix = isOrdered ? `${itemIndex}. ` : '- ';
+      lines.push(`${indent}${prefix}${text}`);
+    }
+
+    for (const sub of nestedLists) {
+      const nested = serializeListNode(sub, depth + 1);
+      if (nested) lines.push(nested);
+    }
+  }
+
+  return lines.join('\n');
 }
 
 function serializeBlockNode(node: Node): string {
@@ -945,6 +1180,9 @@ function serializeBlockNode(node: Node): string {
   }
 
   const align = getElementAlign(el);
+  const paddingLeft = getElementPaddingLeft(el);
+  const textIndent = getElementTextIndent(el);
+  const blockStyles = { align, paddingLeft, textIndent };
   const blockHex = el.style?.color ? normalizeColorToHex(el.style.color) : null;
   const applyBlockColor = (text: string): string =>
     text && blockHex ? `<span style="color: ${blockHex}">${text}</span>` : text;
@@ -959,7 +1197,7 @@ function serializeBlockNode(node: Node): string {
         .trim()
     );
     const md = text ? `${'#'.repeat(level)} ${text}` : '';
-    return wrapAlignedMarkdown(align, md);
+    return wrapStyledMarkdown(blockStyles, md);
   }
 
   if (tag === 'blockquote') {
@@ -993,45 +1231,12 @@ function serializeBlockNode(node: Node): string {
     const md = calloutTag
       ? [`> [!${calloutTag}]`, ...bodyLines].join('\n')
       : bodyLines.join('\n');
-    return wrapAlignedMarkdown(align, md);
+    return wrapStyledMarkdown(blockStyles, md);
   }
 
-  if (tag === 'ul') {
-    const items = Array.from(el.children)
-      .filter((child) => child.tagName.toLowerCase() === 'li')
-      .map((li) => {
-        const liEl = li as HTMLElement;
-        const liHex = liEl.style?.color ? normalizeColorToHex(liEl.style.color) : null;
-        const children = Array.from(li.childNodes);
-        const rawText = children
-          .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
-          .join('')
-          .trim();
-        const text =
-          rawText && liHex ? `<span style="color: ${liHex}">${rawText}</span>` : rawText;
-        return text ? `- ${text}` : '';
-      })
-      .filter(Boolean);
-    return wrapAlignedMarkdown(align, items.join('\n'));
-  }
-
-  if (tag === 'ol') {
-    const items = Array.from(el.children)
-      .filter((child) => child.tagName.toLowerCase() === 'li')
-      .map((li, index) => {
-        const liEl = li as HTMLElement;
-        const liHex = liEl.style?.color ? normalizeColorToHex(liEl.style.color) : null;
-        const children = Array.from(li.childNodes);
-        const rawText = children
-          .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
-          .join('')
-          .trim();
-        const text =
-          rawText && liHex ? `<span style="color: ${liHex}">${rawText}</span>` : rawText;
-        return text ? `${index + 1}. ${text}` : '';
-      })
-      .filter(Boolean);
-    return wrapAlignedMarkdown(align, items.join('\n'));
+  if (tag === 'ul' || tag === 'ol') {
+    const serialized = serializeListNode(el, 0);
+    return wrapStyledMarkdown(blockStyles, serialized);
   }
 
   if (tag === 'pre') {
@@ -1060,7 +1265,7 @@ function serializeBlockNode(node: Node): string {
         .map(serializeBlockNode)
         .filter(Boolean)
         .join('\n\n');
-      return wrapAlignedMarkdown(align, inner);
+      return wrapStyledMarkdown(blockStyles, inner);
     }
     const children = Array.from(el.childNodes);
     const text = applyBlockColor(
@@ -1069,7 +1274,7 @@ function serializeBlockNode(node: Node): string {
         .join('')
         .trim()
     );
-    return wrapAlignedMarkdown(align, text);
+    return wrapStyledMarkdown(blockStyles, text);
   }
 
   const children = Array.from(el.childNodes);
@@ -1421,6 +1626,329 @@ export function applyRawMarkdownFormat(
     nextValue,
     nextStart: lineStart,
     nextEnd: lineStart + replacement.length,
+  };
+}
+
+export function applyRawTabIndent(
+  value: string,
+  selectionStart: number,
+  selectionEnd: number,
+  isShift: boolean
+): { nextValue: string; nextStart: number; nextEnd: number; handled: boolean } {
+  const lineStart = value.lastIndexOf('\n', Math.max(0, selectionStart - 1)) + 1;
+  const lineEndIndex = value.indexOf('\n', selectionEnd);
+  const lineEnd = lineEndIndex === -1 ? value.length : lineEndIndex;
+
+  // Check if inside a fenced code block (``` ... ```)
+  const beforeCursor = value.slice(0, lineStart);
+  const fenceMatches = beforeCursor.match(/^```/gm);
+  const inFencedCode = Boolean(fenceMatches && fenceMatches.length % 2 === 1);
+
+  const selectedBlock = value.slice(lineStart, lineEnd);
+  const selectedLines = selectedBlock.split('\n');
+  const listLineRe = /^(?: *|\t*)(?:[-*+]|\d+\.)\s+/;
+  const nonEmptyLines = selectedLines.filter((l) => l.trim().length > 0);
+  const isListSelection =
+    nonEmptyLines.length > 0 && nonEmptyLines.every((l) => listLineRe.test(l));
+
+  // 1. Inside fenced code block OR on list item line(s): 2-space indent/outdent
+  if (inFencedCode || isListSelection) {
+    if (!isShift) {
+      const indented = selectedLines
+        .map((l) => (l.length > 0 || selectedLines.length === 1 ? `  ${l}` : l))
+        .join('\n');
+      const nextValue =
+        value.slice(0, lineStart) + indented + value.slice(lineEnd);
+      const addedChars = indented.length - selectedBlock.length;
+      const firstLineShift =
+        selectedLines[0].length > 0 || selectedLines.length === 1 ? 2 : 0;
+      return {
+        nextValue,
+        nextStart: selectionStart + firstLineShift,
+        nextEnd: selectionEnd + addedChars,
+        handled: true,
+      };
+    } else {
+      let removedFirst = 0;
+      let removedTotal = 0;
+      const outdented = selectedLines
+        .map((l, idx) => {
+          const m = /^( {1,2}|\t)/.exec(l);
+          if (!m) return l;
+          const len = m[1].length;
+          if (idx === 0) removedFirst = len;
+          removedTotal += len;
+          return l.slice(len);
+        })
+        .join('\n');
+      if (removedTotal === 0) {
+        return {
+          nextValue: value,
+          nextStart: selectionStart,
+          nextEnd: selectionEnd,
+          handled: true,
+        };
+      }
+      const nextValue =
+        value.slice(0, lineStart) + outdented + value.slice(lineEnd);
+      const nextStart = Math.max(lineStart, selectionStart - removedFirst);
+      const nextEnd = Math.max(nextStart, selectionEnd - removedTotal);
+      return { nextValue, nextStart, nextEnd, handled: true };
+    }
+  }
+
+  // 2. Check if cursor/selection is inside or on an existing <div style="..."> or <p style="...">
+  const findEnclosingStyledWrapper = (): {
+    tag: 'div' | 'p';
+    openStart: number;
+    openEnd: number;
+    attrs: string;
+    closeStart: number;
+    closeEnd: number;
+  } | null => {
+    // Check if the selected slice itself starts with an open wrapper and ends with its close tag
+    const selfOpen = /^<(div|p)\s+([^>]+)>/i.exec(selectedBlock.trim());
+    if (selfOpen) {
+      const tag = selfOpen[1].toLowerCase() as 'div' | 'p';
+      const leadingWs = selectedBlock.length - selectedBlock.trimStart().length;
+      const openStart = lineStart + leadingWs;
+      const openEnd = openStart + selfOpen[0].length;
+      const closeRe = new RegExp(`</${tag}>\\s*$`, 'i');
+      const closeM = closeRe.exec(selectedBlock);
+      if (closeM) {
+        const closeStart = lineStart + closeM.index;
+        const closeEnd = lineEnd;
+        return {
+          tag,
+          openStart,
+          openEnd,
+          attrs: selfOpen[2],
+          closeStart,
+          closeEnd,
+        };
+      }
+    }
+
+    // Otherwise scan backwards for an unclosed <div style="..."> or <p style="...">
+    const prefixText = value.slice(0, lineStart);
+    const tagRe = /<(div|p)\s+([^>]+)>|<\/(div|p)>/gi;
+    const stack: Array<{
+      tag: 'div' | 'p';
+      openStart: number;
+      openEnd: number;
+      attrs: string;
+    }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = tagRe.exec(prefixText)) !== null) {
+      if (m[1]) {
+        stack.push({
+          tag: m[1].toLowerCase() as 'div' | 'p',
+          openStart: m.index,
+          openEnd: tagRe.lastIndex,
+          attrs: m[2],
+        });
+      } else if (m[3]) {
+        const closingTag = m[3].toLowerCase();
+        for (let s = stack.length - 1; s >= 0; s--) {
+          if (stack[s].tag === closingTag) {
+            stack.splice(s, 1);
+            break;
+          }
+        }
+      }
+    }
+
+    if (stack.length === 0) return null;
+    const candidate = stack[stack.length - 1];
+    const closeTagRe = new RegExp(`</${candidate.tag}>`, 'i');
+    const afterOpen = value.slice(lineEnd);
+    const closeMatch = closeTagRe.exec(afterOpen);
+    if (!closeMatch) return null;
+
+    return {
+      tag: candidate.tag,
+      openStart: candidate.openStart,
+      openEnd: candidate.openEnd,
+      attrs: candidate.attrs,
+      closeStart: lineEnd + closeMatch.index,
+      closeEnd: lineEnd + closeMatch.index + closeMatch[0].length,
+    };
+  };
+
+  const updateIndentInAttrs = (
+    attrs: string,
+    deltaRem: number
+  ): { nextTagAttrs: string | null; changed: boolean } => {
+    const existingStyle = getAttr(attrs, 'style') ?? '';
+    const decls: Array<[string, string]> = [];
+    for (const part of existingStyle.split(';')) {
+      const colonIdx = part.indexOf(':');
+      if (colonIdx === -1) continue;
+      const prop = part.slice(0, colonIdx).trim().toLowerCase();
+      const val = part.slice(colonIdx + 1).trim();
+      if (prop && val) decls.push([prop, val]);
+    }
+
+    const padIdx = decls.findIndex(
+      ([prop]) => prop === 'padding-left' || prop === 'margin-left'
+    );
+    const indentIdx = decls.findIndex(([prop]) => prop === 'text-indent');
+    const currentRem = padIdx !== -1 ? parseIndentRem(decls[padIdx][1]) : 0;
+
+    if (deltaRem > 0) {
+      const nextRem = Math.min(12, currentRem + deltaRem);
+      if (nextRem === currentRem) return { nextTagAttrs: attrs, changed: false };
+      if (padIdx !== -1) {
+        decls[padIdx] = ['padding-left', `${nextRem}rem`];
+      } else {
+        decls.push(['padding-left', `${nextRem}rem`]);
+      }
+    } else {
+      if (currentRem > 0) {
+        const nextRem = Math.max(0, currentRem + deltaRem);
+        if (nextRem > 0) {
+          decls[padIdx] = ['padding-left', `${nextRem}rem`];
+        } else {
+          decls.splice(padIdx, 1);
+        }
+      } else if (indentIdx !== -1) {
+        const currentTextIndent = parseIndentRem(decls[indentIdx][1]);
+        const nextTextIndent = Math.max(0, currentTextIndent + deltaRem);
+        if (nextTextIndent > 0) {
+          decls[indentIdx] = ['text-indent', `${nextTextIndent}em`];
+        } else {
+          decls.splice(indentIdx, 1);
+        }
+      } else {
+        return { nextTagAttrs: attrs, changed: false };
+      }
+    }
+
+    const remainingAttrs = attrs
+      .replace(/style\s*=\s*(?:"[^"]*"|'[^']*')/i, '')
+      .trim();
+
+    if (decls.length === 0) {
+      if (!remainingAttrs) {
+        return { nextTagAttrs: null, changed: true };
+      }
+      return { nextTagAttrs: remainingAttrs, changed: true };
+    }
+
+    const nextStyle = decls.map(([k, v]) => `${k}: ${v}`).join('; ');
+    const nextAttrs = remainingAttrs
+      ? `${remainingAttrs} style="${nextStyle}"`
+      : `style="${nextStyle}"`;
+    return { nextTagAttrs: nextAttrs, changed: true };
+  };
+
+  const wrapper = findEnclosingStyledWrapper();
+  if (wrapper) {
+    const delta = isShift ? -2 : 2;
+    const { nextTagAttrs, changed } = updateIndentInAttrs(wrapper.attrs, delta);
+    if (!changed) {
+      return {
+        nextValue: value,
+        nextStart: selectionStart,
+        nextEnd: selectionEnd,
+        handled: true,
+      };
+    }
+
+    if (nextTagAttrs === null) {
+      // Unwrap the <div style="...">...</div> cleanly
+      const rawInner = value.slice(wrapper.openEnd, wrapper.closeStart);
+      const leadingTrimMatch = /^\n{1,2}/.exec(rawInner);
+      const trailingTrimMatch = /\n{1,2}$/.exec(rawInner);
+      const leadLen = leadingTrimMatch ? leadingTrimMatch[0].length : 0;
+      const trailLen = trailingTrimMatch ? trailingTrimMatch[0].length : 0;
+      const inner = rawInner.slice(leadLen, rawInner.length - trailLen);
+
+      const nextValue =
+        value.slice(0, wrapper.openStart) + inner + value.slice(wrapper.closeEnd);
+      const removedBefore = wrapper.openEnd - wrapper.openStart + leadLen;
+      const nextStart = Math.max(wrapper.openStart, selectionStart - removedBefore);
+      const nextEnd = Math.max(nextStart, selectionEnd - removedBefore);
+      return { nextValue, nextStart, nextEnd, handled: true };
+    }
+
+    const nextOpenTag = `<${wrapper.tag} ${nextTagAttrs}>`;
+    const oldOpenLen = wrapper.openEnd - wrapper.openStart;
+    const diff = nextOpenTag.length - oldOpenLen;
+    const nextValue =
+      value.slice(0, wrapper.openStart) +
+      nextOpenTag +
+      value.slice(wrapper.openEnd);
+
+    const nextStart =
+      selectionStart >= wrapper.openEnd ? selectionStart + diff : selectionStart;
+    const nextEnd =
+      selectionEnd >= wrapper.openEnd ? selectionEnd + diff : selectionEnd;
+    return { nextValue, nextStart, nextEnd, handled: true };
+  }
+
+  // 3. Plain paragraph without wrapper
+  if (isShift) {
+    return {
+      nextValue: value,
+      nextStart: selectionStart,
+      nextEnd: selectionEnd,
+      handled: true,
+    };
+  }
+
+  // Expand to full contiguous non-empty paragraph if cursor is collapsed inside plain lines
+  let paraStart = lineStart;
+  let paraEnd = lineEnd;
+  if (selectionStart === selectionEnd && selectedBlock.trim().length > 0) {
+    while (paraStart > 0) {
+      const prevNl = value.lastIndexOf('\n', paraStart - 2);
+      const prevLineStart = prevNl === -1 ? 0 : prevNl + 1;
+      const prevLine = value.slice(prevLineStart, paraStart - 1);
+      if (
+        prevLine.trim() === '' ||
+        /^(#{1,3}\s+|>\s?|[-*+]\s+|\d+\.\s+|```|\$\$|<\/?(?:div|p|iframe|video)|-{3,}$|\*{3,}$)/.test(
+          prevLine.trim()
+        )
+      ) {
+        break;
+      }
+      paraStart = prevLineStart;
+    }
+    while (paraEnd < value.length) {
+      const nextNl = value.indexOf('\n', paraEnd + 1);
+      const nextLineEnd = nextNl === -1 ? value.length : nextNl;
+      const nextLine = value.slice(paraEnd + 1, nextLineEnd);
+      if (
+        nextLine.trim() === '' ||
+        /^(#{1,3}\s+|>\s?|[-*+]\s+|\d+\.\s+|```|\$\$|<\/?(?:div|p|iframe|video)|-{3,}$|\*{3,}$)/.test(
+          nextLine.trim()
+        )
+      ) {
+        break;
+      }
+      paraEnd = nextLineEnd;
+    }
+  }
+
+  const paraContent = value.slice(paraStart, paraEnd);
+  const openTag = '<div style="padding-left: 2rem;">\n\n';
+  const closeTag = '\n\n</div>';
+
+  if (paraContent.trim() === '') {
+    const inserted = `${openTag}${closeTag}`;
+    const nextValue = value.slice(0, paraStart) + inserted + value.slice(paraEnd);
+    const caret = paraStart + openTag.length;
+    return { nextValue, nextStart: caret, nextEnd: caret, handled: true };
+  }
+
+  const inserted = `${openTag}${paraContent}${closeTag}`;
+  const nextValue = value.slice(0, paraStart) + inserted + value.slice(paraEnd);
+  return {
+    nextValue,
+    nextStart: selectionStart + openTag.length,
+    nextEnd: selectionEnd + openTag.length,
+    handled: true,
   };
 }
 

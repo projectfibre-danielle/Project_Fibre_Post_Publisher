@@ -72,6 +72,24 @@
   margin-bottom: 1rem;
 }
 
+.rich-editor-surface ul ul,
+.rich-editor-surface ol ul {
+  list-style-type: circle;
+  margin-top: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.rich-editor-surface ul ul ul,
+.rich-editor-surface ol ul ul {
+  list-style-type: square;
+}
+
+.rich-editor-surface ol ol,
+.rich-editor-surface ul ol {
+  margin-top: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
 .rich-editor-surface li {
   margin-bottom: 0.35rem;
   line-height: 1.7;

@@ -24,6 +24,7 @@ export interface BlogPost {
 }
 
 export interface DraftPost {
+  activeDraftId?: string | null;
   editingId: string | null;
   title: string;
   slug: string;
@@ -33,6 +34,12 @@ export interface DraftPost {
   content: string;
   createdAt: string | null;
   extraFields?: Record<string, unknown>;
+}
+
+export interface SavedDraft extends DraftPost {
+  draftId: string;
+  savedAt: string;
+  publishedAt?: string | null;
 }
 
 export type PublishStatusType =

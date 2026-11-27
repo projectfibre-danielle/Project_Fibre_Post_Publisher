@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import katex from 'katex';
-import { ImageOff } from 'lucide-react';
+import { AlertCircle, ImageOff, Info, Lightbulb } from 'lucide-react';
 import {
   calculateReadingStats,
   InlineToken,
@@ -24,10 +24,15 @@ interface MarkdownPreviewProps {
 const alignClass = (align?: TextAlign): string => {
   if (align === 'center') return 'text-center';
   if (align === 'right') return 'text-right';
-  return 'text-left';
+  if (align === 'left') return 'text-left';
+  return '';
 };
 
-const PreviewImage: React.FC<{ src: string; alt: string }> = ({ src, alt }) => {
+const PreviewImage: React.FC<{
+  src: string;
+  alt: string;
+  align?: TextAlign;
+}> = ({ src, alt, align }) => {
   const [failed, setFailed] = useState(false);
 
   if (!src || !isSafeUrl(src) || failed) {
@@ -39,6 +44,9 @@ const PreviewImage: React.FC<{ src: string; alt: string }> = ({ src, alt }) => {
     );
   }
 
+  const imgAlign =
+    align === 'right' ? 'ml-auto' : align === 'left' ? 'mr-auto' : 'mx-auto';
+
   return (
     <figure className="my-5">
       <img
@@ -46,10 +54,12 @@ const PreviewImage: React.FC<{ src: string; alt: string }> = ({ src, alt }) => {
         alt={alt}
         referrerPolicy="no-referrer"
         onError={() => setFailed(true)}
-        className="mx-auto max-h-[420px] max-w-full rounded-lg border border-[#E4E4E7] object-contain"
+        className={`${imgAlign} max-h-[420px] max-w-full rounded-lg border border-[#E4E4E7] object-contain`}
       />
       {alt && alt !== 'Image' && (
-        <figcaption className="mt-2 text-center text-xs text-[#71717A]">
+        <figcaption
+          className={`mt-2 text-xs text-[#71717A] ${alignClass(align) || 'text-center'}`}
+        >
           {alt}
         </figcaption>
       )}
@@ -71,18 +81,26 @@ function renderMathHtml(formula: string, displayMode: boolean): string {
 
 function renderInlineTokens(tokens: InlineToken[]): React.ReactNode {
   return tokens.map((token, idx) => {
+    const inner = token.children ? renderInlineTokens(token.children) : token.text;
+
     switch (token.type) {
       case 'bold':
         return (
           <strong key={idx} className="font-semibold text-[#18181B]">
-            {token.text}
+            {inner}
           </strong>
         );
       case 'italic':
         return (
           <em key={idx} className="italic text-[#27272A]">
-            {token.text}
+            {inner}
           </em>
+        );
+      case 'underline':
+        return (
+          <span key={idx} className="underline underline-offset-4">
+            {inner}
+          </span>
         );
       case 'code':
         return (
@@ -98,7 +116,7 @@ function renderInlineTokens(tokens: InlineToken[]): React.ReactNode {
       case 'color':
         return (
           <span key={idx} style={{ color: token.color || '#18181B' }}>
-            {token.children ? renderInlineTokens(token.children) : token.text}
+            {inner}
           </span>
         );
       case 'math_inline':
@@ -128,7 +146,7 @@ function renderInlineTokens(tokens: InlineToken[]): React.ReactNode {
             rel="noopener noreferrer"
             className="text-[#2563EB] underline decoration-[#2563EB]/40 underline-offset-4 transition-colors hover:decoration-[#2563EB]"
           >
-            {token.text}
+            {inner}
           </a>
         );
       default:
@@ -137,12 +155,26 @@ function renderInlineTokens(tokens: InlineToken[]): React.ReactNode {
   });
 }
 
-function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
+function renderBlock(
+  block: MarkdownBlock,
+  index: number,
+  inheritedAlign?: TextAlign
+): React.ReactNode {
+  const effectiveAlign =
+    block.type === 'aligned' ? block.align : ('align' in block ? block.align : undefined) ?? inheritedAlign;
+  const alignmentCls = alignClass(effectiveAlign);
+
   switch (block.type) {
     case 'aligned':
       return (
-        <div key={index} className={alignClass(block.align)}>
-          {block.blocks.map((inner, innerIdx) => renderBlock(inner, innerIdx))}
+        <div
+          key={index}
+          className={alignClass(block.align)}
+          style={{ textAlign: block.align }}
+        >
+          {block.blocks.map((inner, innerIdx) =>
+            renderBlock(inner, innerIdx, block.align)
+          )}
         </div>
       );
     case 'heading': {
@@ -150,7 +182,7 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
         return (
           <h2
             key={index}
-            className={`mt-8 mb-3 font-serif text-2xl font-semibold tracking-tight text-[#18181B] ${alignClass(block.align)}`}
+            className={`mt-8 mb-3 font-serif text-2xl font-semibold tracking-tight text-[#18181B] ${alignmentCls}`}
           >
             {renderInlineTokens(block.tokens)}
           </h2>
@@ -160,7 +192,7 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
         return (
           <h3
             key={index}
-            className={`mt-7 mb-2.5 font-serif text-xl font-semibold tracking-tight text-[#18181B] ${alignClass(block.align)}`}
+            className={`mt-7 mb-2.5 font-serif text-xl font-semibold tracking-tight text-[#18181B] ${alignmentCls}`}
           >
             {renderInlineTokens(block.tokens)}
           </h3>
@@ -169,7 +201,7 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
       return (
         <h4
           key={index}
-          className={`mt-6 mb-2 font-serif text-lg font-semibold text-[#18181B] ${alignClass(block.align)}`}
+          className={`mt-6 mb-2 font-serif text-lg font-semibold text-[#18181B] ${alignmentCls}`}
         >
           {renderInlineTokens(block.tokens)}
         </h4>
@@ -179,7 +211,7 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
       return (
         <p
           key={index}
-          className={`mb-4 text-[15.5px] leading-[1.75] text-[#27272A] ${alignClass(block.align)}`}
+          className={`mb-4 text-[15.5px] leading-[1.75] text-[#27272A] ${alignmentCls}`}
         >
           {renderInlineTokens(block.tokens)}
         </p>
@@ -188,7 +220,7 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
       return (
         <blockquote
           key={index}
-          className="my-5 rounded-lg border border-[#E4E4E7] bg-[#F4F4F5]/70 px-5 py-4 font-serif text-[16px] italic leading-[1.65] text-[#3F3F46]"
+          className={`my-5 rounded-lg border border-[#E4E4E7] bg-[#F4F4F5]/70 px-5 py-4 font-serif text-[16px] italic leading-[1.65] text-[#3F3F46] ${alignmentCls}`}
         >
           {block.lines.map((line, lineIdx) => (
             <p key={lineIdx} className={lineIdx > 0 ? 'mt-2' : ''}>
@@ -197,11 +229,55 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
           ))}
         </blockquote>
       );
+    case 'callout': {
+      const config =
+        block.kind === 'note'
+          ? {
+              label: 'Note',
+              wrapper: 'border-[#BFDBFE] bg-[#EFF6FF] text-[#1E3A8A]',
+              heading: 'text-[#1D4ED8]',
+              icon: <Info className="h-4 w-4 shrink-0 text-[#2563EB]" />,
+            }
+          : block.kind === 'tip'
+            ? {
+                label: 'Tip',
+                wrapper: 'border-[#A7F3D0] bg-[#ECFDF5] text-[#064E3B]',
+                heading: 'text-[#047857]',
+                icon: <Lightbulb className="h-4 w-4 shrink-0 text-[#059669]" />,
+              }
+            : {
+                label: 'Important',
+                wrapper: 'border-[#DDD6FE] bg-[#F5F3FF] text-[#3B0764]',
+                heading: 'text-[#6D28D9]',
+                icon: <AlertCircle className="h-4 w-4 shrink-0 text-[#7C3AED]" />,
+              };
+      return (
+        <aside
+          key={index}
+          aria-label={config.label}
+          className={`my-5 rounded-xl border px-5 py-4 text-[15px] leading-[1.7] ${config.wrapper} ${alignmentCls}`}
+        >
+          <div className={`mb-1.5 flex items-center gap-2 text-xs font-semibold ${config.heading}`}>
+            {config.icon}
+            <span>{config.label}</span>
+          </div>
+          {block.lines.map((line, lineIdx) => (
+            <p key={lineIdx} className={lineIdx > 0 ? 'mt-2' : ''}>
+              {renderInlineTokens(line)}
+            </p>
+          ))}
+        </aside>
+      );
+    }
     case 'ul':
       return (
         <ul
           key={index}
-          className="mb-4 list-disc space-y-1.5 pl-6 text-[15.5px] leading-[1.7] text-[#27272A]"
+          className={`mb-4 list-disc space-y-1.5 text-[15.5px] leading-[1.7] text-[#27272A] ${
+            effectiveAlign && effectiveAlign !== 'left'
+              ? `list-inside ${alignmentCls}`
+              : 'pl-6'
+          }`}
         >
           {block.items.map((item, itemIdx) => (
             <li key={itemIdx}>{renderInlineTokens(item)}</li>
@@ -212,7 +288,11 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
       return (
         <ol
           key={index}
-          className="mb-4 list-decimal space-y-1.5 pl-6 text-[15.5px] leading-[1.7] text-[#27272A]"
+          className={`mb-4 list-decimal space-y-1.5 text-[15.5px] leading-[1.7] text-[#27272A] ${
+            effectiveAlign && effectiveAlign !== 'left'
+              ? `list-inside ${alignmentCls}`
+              : 'pl-6'
+          }`}
         >
           {block.items.map((item, itemIdx) => (
             <li key={itemIdx}>{renderInlineTokens(item)}</li>
@@ -223,7 +303,7 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
       return (
         <pre
           key={index}
-          className="my-5 overflow-x-auto rounded-lg border border-[#E4E4E7] bg-[#18181B] p-4 font-mono text-[13px] leading-relaxed text-[#F4F4F5]"
+          className="my-5 overflow-x-auto rounded-lg border border-[#E4E4E7] bg-[#18181B] p-4 text-left font-mono text-[13px] leading-relaxed text-[#F4F4F5]"
         >
           <code>{block.code}</code>
         </pre>
@@ -239,7 +319,14 @@ function renderBlock(block: MarkdownBlock, index: number): React.ReactNode {
         />
       );
     case 'image':
-      return <PreviewImage key={index} src={block.src} alt={block.alt} />;
+      return (
+        <PreviewImage
+          key={index}
+          src={block.src}
+          alt={block.alt}
+          align={effectiveAlign}
+        />
+      );
     case 'video':
       if (block.kind === 'iframe' && isAllowedIframeSrc(block.src)) {
         return (

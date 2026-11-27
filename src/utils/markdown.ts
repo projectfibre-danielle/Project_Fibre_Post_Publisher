@@ -1,6 +1,7 @@
 export type FormatAction =
   | 'bold'
   | 'italic'
+  | 'underline'
   | 'h1'
   | 'h2'
   | 'h3'
@@ -18,17 +19,22 @@ export type FormatAction =
   | 'image'
   | 'video'
   | 'mathInline'
-  | 'mathBlock';
+  | 'mathBlock'
+  | 'calloutNote'
+  | 'calloutTip'
+  | 'calloutImportant';
 
 export type TextAlign = 'left' | 'center' | 'right';
+export type CalloutKind = 'note' | 'tip' | 'important';
 
 export const PRESET_TEXT_COLORS: Array<{ name: string; hex: string }> = [
+  { name: 'Deep Plum', hex: '#2d1f3d' },
+  { name: 'Blush Rose', hex: '#e8b4c8' },
   { name: 'Ink Black', hex: '#18181B' },
   { name: 'Cobalt Blue', hex: '#2563EB' },
   { name: 'Emerald', hex: '#059669' },
   { name: 'Amber', hex: '#D97706' },
   { name: 'Crimson', hex: '#DC2626' },
-  { name: 'Violet', hex: '#7C3AED' },
   { name: 'Slate Muted', hex: '#64748B' },
 ];
 
@@ -37,6 +43,7 @@ export interface InlineToken {
     | 'text'
     | 'bold'
     | 'italic'
+    | 'underline'
     | 'code'
     | 'link'
     | 'image'
@@ -55,6 +62,7 @@ export type MarkdownBlock =
   | { type: 'heading'; level: 1 | 2 | 3; tokens: InlineToken[]; align?: TextAlign }
   | { type: 'paragraph'; tokens: InlineToken[]; align?: TextAlign }
   | { type: 'blockquote'; lines: InlineToken[][] }
+  | { type: 'callout'; kind: CalloutKind; lines: InlineToken[][] }
   | { type: 'ul'; items: InlineToken[][] }
   | { type: 'ol'; items: InlineToken[][] }
   | { type: 'codeblock'; lang: string; code: string }
@@ -129,8 +137,11 @@ export function resolveVideoEmbed(
     const parsed = new URL(trimmed);
     const host = parsed.hostname.replace(/^www\./, '').toLowerCase();
 
-    // YouTube watch / share / shorts / embed
-    if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'youtube-nocookie.com') {
+    if (
+      host === 'youtube.com' ||
+      host === 'm.youtube.com' ||
+      host === 'youtube-nocookie.com'
+    ) {
       if (parsed.pathname.startsWith('/embed/')) {
         const videoId = parsed.pathname.split('/embed/')[1]?.split(/[/?]/)[0];
         if (videoId) {
@@ -170,7 +181,6 @@ export function resolveVideoEmbed(
       }
     }
 
-    // Vimeo
     if (host === 'vimeo.com' || host === 'player.vimeo.com') {
       const match = /\/(?:video\/)?(\d+)/.exec(parsed.pathname);
       if (match?.[1]) {
@@ -220,10 +230,27 @@ function getAttr(attrString: string, name: string): string | null {
   return match ? (match[1] ?? match[2] ?? '') : null;
 }
 
-export function parseInlineMarkdown(text: string): InlineToken[] {
+export function parseInlineMarkdown(text: string, depth = 0): InlineToken[] {
+  if (!text) return [];
+  if (depth > 8) return [{ type: 'text', text }];
+
   const tokens: InlineToken[] = [];
+  // Precedence order:
+  // 1. <br />
+  // 2. <span style="...">...</span> (color and/or text-decoration: underline)
+  // 3. <u>...</u>
+  // 4. <strong>...</strong> / <b>...</b>
+  // 5. <em>...</em> / <i>...</i>
+  // 6. ![alt](url)
+  // 7. [label](url)
+  // 8. `inline code`
+  // 9. $inline math$
+  // 10. ***bold italic*** or ___bold italic___
+  // 11. **bold**
+  // 12. _italic_ (primary italic syntax, safe against snake_case identifiers)
+  // 13. *italic* (fallback for legacy posts)
   const pattern =
-    /(<br\s*\/?>|<span\s+style=["']\s*color:\s*(#[0-9a-fA-F]{3,8})\s*;?\s*["']\s*>([\s\S]*?)<\/span>|!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(([^)\s]+)\)|`([^`]+)`|\$(?!\$)([^\n$]+?)\$|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\n]+)\*|_([^_\n]+)_)/g;
+    /(<br\s*\/?>|<span\s+style=["']([^"']+)["']\s*>([\s\S]*?)<\/span>|<u>([\s\S]*?)<\/u>|<(?:strong|b)>([\s\S]*?)<\/(?:strong|b)>|<(?:em|i)>([\s\S]*?)<\/(?:em|i)>|!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(([^)\s]+)\)|`([^`]+)`|\$(?!\$)([^\n$]+?)\$|\*\*\*([^\n*]+?)\*\*\*|___([^\n_]+?)___|(?:\*\*([^\n]+?)\*\*)|(?:(?<![\w\\])_([^\n_]+?)_(?!\w))|(?:(?<!\*)\*(?!\*)([^\n*]+?)(?<!\*)\*(?!\*)))/gi;
 
   let lastIndex = 0;
   let match: RegExpExecArray | null;
@@ -238,36 +265,106 @@ export function parseInlineMarkdown(text: string): InlineToken[] {
     if (/^<br\s*\/?>$/i.test(full)) {
       tokens.push({ type: 'br', text: '' });
     } else if (match[2] !== undefined && match[3] !== undefined) {
-      const hex = match[2].trim();
+      const styleStr = match[2];
+      const inner = match[3];
+      const colorMatch = /color\s*:\s*([^;]+)/i.exec(styleStr);
+      const rawColor = colorMatch ? normalizeColorToHex(colorMatch[1]) : null;
+      const hasUnderline = /text-decoration(?:-line)?\s*:\s*underline/i.test(styleStr);
+      const innerTokens = parseInlineMarkdown(inner, depth + 1);
+
+      if (rawColor && hasUnderline) {
+        tokens.push({
+          type: 'color',
+          text: inner,
+          color: rawColor,
+          children: [
+            {
+              type: 'underline',
+              text: inner,
+              children: innerTokens,
+            },
+          ],
+        });
+      } else if (rawColor) {
+        tokens.push({
+          type: 'color',
+          text: inner,
+          color: rawColor,
+          children: innerTokens,
+        });
+      } else if (hasUnderline) {
+        tokens.push({
+          type: 'underline',
+          text: inner,
+          children: innerTokens,
+        });
+      } else {
+        tokens.push(...innerTokens);
+      }
+    } else if (match[4] !== undefined) {
       tokens.push({
-        type: 'color',
-        text: match[3],
-        color: isSafeHexColor(hex) ? hex : '#18181B',
-        children: parseInlineMarkdown(match[3]),
+        type: 'underline',
+        text: match[4],
+        children: parseInlineMarkdown(match[4], depth + 1),
       });
-    } else if (match[4] !== undefined && match[5] !== undefined) {
-      const src = match[5].trim();
+    } else if (match[5] !== undefined) {
+      tokens.push({
+        type: 'bold',
+        text: match[5],
+        children: parseInlineMarkdown(match[5], depth + 1),
+      });
+    } else if (match[6] !== undefined) {
+      tokens.push({
+        type: 'italic',
+        text: match[6],
+        children: parseInlineMarkdown(match[6], depth + 1),
+      });
+    } else if (match[7] !== undefined && match[8] !== undefined) {
+      const src = match[8].trim();
       tokens.push({
         type: 'image',
-        text: match[4],
-        alt: match[4],
+        text: match[7],
+        alt: match[7],
         src: isSafeUrl(src) ? src : '',
       });
-    } else if (match[6] !== undefined && match[7] !== undefined) {
-      const href = match[7].trim();
+    } else if (match[9] !== undefined && match[10] !== undefined) {
+      const href = match[10].trim();
       tokens.push({
         type: 'link',
-        text: match[6],
+        text: match[9],
         href: isSafeUrl(href) ? href : '#',
+        children: parseInlineMarkdown(match[9], depth + 1),
       });
-    } else if (match[8] !== undefined) {
-      tokens.push({ type: 'code', text: match[8] });
-    } else if (match[9] !== undefined) {
-      tokens.push({ type: 'math_inline', text: match[9].trim() });
-    } else if (match[10] !== undefined || match[11] !== undefined) {
-      tokens.push({ type: 'bold', text: match[10] ?? match[11] });
-    } else if (match[12] !== undefined || match[13] !== undefined) {
-      tokens.push({ type: 'italic', text: match[12] ?? match[13] });
+    } else if (match[11] !== undefined) {
+      tokens.push({ type: 'code', text: match[11] });
+    } else if (match[12] !== undefined) {
+      tokens.push({ type: 'math_inline', text: match[12].trim() });
+    } else if (match[13] !== undefined || match[14] !== undefined) {
+      const inner = match[13] ?? match[14];
+      tokens.push({
+        type: 'bold',
+        text: inner,
+        children: [
+          {
+            type: 'italic',
+            text: inner,
+            children: parseInlineMarkdown(inner, depth + 1),
+          },
+        ],
+      });
+    } else if (match[15] !== undefined) {
+      tokens.push({
+        type: 'bold',
+        text: match[15],
+        children: parseInlineMarkdown(match[15], depth + 1),
+      });
+    } else if (match[16] !== undefined || match[17] !== undefined) {
+      const inner = match[16] ?? match[17];
+      tokens.push({
+        type: 'italic',
+        text: inner,
+        children: parseInlineMarkdown(inner, depth + 1),
+      });
     }
 
     lastIndex = pattern.lastIndex;
@@ -291,6 +388,82 @@ function extractAlignFromTag(openTagAttrs: string): TextAlign | null {
     return attrAlign.trim().toLowerCase() as TextAlign;
   }
   return null;
+}
+
+function findMatchingClosingTag(
+  lines: string[],
+  startLineIdx: number,
+  tagName: 'div' | 'p',
+  afterOpenOnStartLine: string
+): { innerMarkdown: string; endLineIdx: number } {
+  const openRe = new RegExp(`<${tagName}(?:\\s+[^>]*)?>`, 'gi');
+  const closeRe = new RegExp(`<\\/${tagName}>`, 'gi');
+
+  // Helper to scan a single line for depth changes
+  const scanLineForClose = (
+    text: string,
+    initialDepth: number
+  ): { nextDepth: number; closeIndex: number } => {
+    const events: Array<{ index: number; delta: number }> = [];
+    openRe.lastIndex = 0;
+    closeRe.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = openRe.exec(text)) !== null) {
+      events.push({ index: m.index, delta: 1 });
+    }
+    while ((m = closeRe.exec(text)) !== null) {
+      events.push({ index: m.index, delta: -1 });
+    }
+    events.sort((a, b) => a.index - b.index);
+
+    let depth = initialDepth;
+    for (const ev of events) {
+      depth += ev.delta;
+      if (depth === 0) {
+        return { nextDepth: 0, closeIndex: ev.index };
+      }
+    }
+    return { nextDepth: depth, closeIndex: -1 };
+  };
+
+  // Check if closed on the very same opening line
+  const sameLineCheck = scanLineForClose(afterOpenOnStartLine, 1);
+  if (sameLineCheck.nextDepth === 0) {
+    return {
+      innerMarkdown: afterOpenOnStartLine.slice(0, sameLineCheck.closeIndex).trim(),
+      endLineIdx: startLineIdx,
+    };
+  }
+
+  let depth = sameLineCheck.nextDepth;
+  const collected: string[] = [];
+  if (afterOpenOnStartLine.trim()) {
+    collected.push(afterOpenOnStartLine);
+  }
+
+  let idx = startLineIdx + 1;
+  while (idx < lines.length) {
+    const line = lines[idx];
+    const res = scanLineForClose(line, depth);
+    if (res.nextDepth === 0) {
+      const beforeClose = line.slice(0, res.closeIndex);
+      if (beforeClose.trim()) {
+        collected.push(beforeClose);
+      }
+      return {
+        innerMarkdown: collected.join('\n'),
+        endLineIdx: idx,
+      };
+    }
+    collected.push(line);
+    depth = res.nextDepth;
+    idx++;
+  }
+
+  return {
+    innerMarkdown: collected.join('\n'),
+    endLineIdx: lines.length - 1,
+  };
 }
 
 export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
@@ -354,37 +527,22 @@ export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
     }
 
     // Aligned wrapper <div style="text-align: ..."> or <div align="..."> or <p style="text-align: ...">
-    const alignedStart = /^<(div|p)\s+([^>]+)>$/i.exec(trimmed);
-    if (alignedStart) {
-      const tagName = alignedStart[1].toLowerCase();
-      const align = extractAlignFromTag(alignedStart[2]);
+    const alignedOpenMatch = /^<(div|p)\s+([^>]+)>(.*)$/i.exec(trimmed);
+    if (alignedOpenMatch) {
+      const tagName = alignedOpenMatch[1].toLowerCase() as 'div' | 'p';
+      const align = extractAlignFromTag(alignedOpenMatch[2]);
       if (align) {
-        const closeTag = `</${tagName}>`;
-        const innerLines: string[] = [];
-        i++;
-        while (i < lines.length && lines[i].trim().toLowerCase() !== closeTag) {
-          innerLines.push(lines[i]);
-          i++;
-        }
-        if (i < lines.length) i++;
-        const innerBlocks = parseMarkdownBlocks(innerLines.join('\n'));
+        const { innerMarkdown, endLineIdx } = findMatchingClosingTag(
+          lines,
+          i,
+          tagName,
+          alignedOpenMatch[3] ?? ''
+        );
+        const innerBlocks = parseMarkdownBlocks(innerMarkdown);
         if (innerBlocks.length > 0) {
           blocks.push({ type: 'aligned', align, blocks: innerBlocks });
         }
-        continue;
-      }
-    }
-
-    // Single-line <p align|style="text-align:...">...</p> or <div ...>...</div>
-    const singleLineAligned = /^<(div|p)\s+([^>]+)>([\s\S]+)<\/\1>$/i.exec(trimmed);
-    if (singleLineAligned) {
-      const align = extractAlignFromTag(singleLineAligned[2]);
-      if (align) {
-        const innerBlocks = parseMarkdownBlocks(singleLineAligned[3].trim());
-        if (innerBlocks.length > 0) {
-          blocks.push({ type: 'aligned', align, blocks: innerBlocks });
-        }
-        i++;
+        i = endLineIdx + 1;
         continue;
       }
     }
@@ -448,16 +606,35 @@ export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
       continue;
     }
 
-    // Blockquote
+    // Blockquote & GFM Callouts ([!NOTE], [!TIP], [!IMPORTANT])
     if (trimmed.startsWith('>')) {
-      const quoteLines: InlineToken[][] = [];
+      const rawQuoteLines: string[] = [];
       while (i < lines.length && lines[i].trim().startsWith('>')) {
-        const content = lines[i].trim().replace(/^>\s?/, '');
-        if (content) {
-          quoteLines.push(parseInlineMarkdown(content));
-        }
+        rawQuoteLines.push(lines[i].trim().replace(/^>\s?/, ''));
         i++;
       }
+
+      const firstLine = rawQuoteLines[0]?.trim() ?? '';
+      const calloutMatch = /^\[!(NOTE|TIP|IMPORTANT)\]\s*(.*)$/i.exec(firstLine);
+      if (calloutMatch) {
+        const kind = calloutMatch[1].toLowerCase() as CalloutKind;
+        const remainder = calloutMatch[2]?.trim() ?? '';
+        const bodyStrings = [
+          ...(remainder ? [remainder] : []),
+          ...rawQuoteLines.slice(1).map((l) => l.trim()),
+        ].filter(Boolean);
+        const calloutLines =
+          bodyStrings.length > 0
+            ? bodyStrings.map((line) => parseInlineMarkdown(line))
+            : [[{ type: 'text' as const, text: '' }]];
+        blocks.push({ type: 'callout', kind, lines: calloutLines });
+        continue;
+      }
+
+      const quoteLines = rawQuoteLines
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .map((line) => parseInlineMarkdown(line));
       if (quoteLines.length > 0) {
         blocks.push({ type: 'blockquote', lines: quoteLines });
       }
@@ -515,21 +692,23 @@ function inlineTokensToHtml(tokens: InlineToken[]): string {
   return tokens
     .map((tok) => {
       const safe = escapeHtml(tok.text);
+      const innerHtml = tok.children ? inlineTokensToHtml(tok.children) : safe;
       switch (tok.type) {
         case 'bold':
-          return `<strong>${safe}</strong>`;
+          return `<strong>${innerHtml}</strong>`;
         case 'italic':
-          return `<em>${safe}</em>`;
+          return `<em>${innerHtml}</em>`;
+        case 'underline':
+          return `<u>${innerHtml}</u>`;
         case 'code':
           return `<code>${safe}</code>`;
         case 'br':
-          return '<br />';
+          return '<br data-explicit-br="true" />';
         case 'math_inline':
           return `$${safe}$`;
         case 'color': {
           const hex = tok.color && isSafeHexColor(tok.color) ? tok.color : '#18181B';
-          const inner = tok.children ? inlineTokensToHtml(tok.children) : safe;
-          return `<span style="color: ${hex}">${inner}</span>`;
+          return `<span style="color: ${hex}">${innerHtml}</span>`;
         }
         case 'image': {
           const safeSrc = tok.src && isSafeUrl(tok.src) ? escapeHtml(tok.src) : '';
@@ -538,7 +717,7 @@ function inlineTokensToHtml(tokens: InlineToken[]): string {
         }
         case 'link': {
           const safeHref = tok.href && isSafeUrl(tok.href) ? escapeHtml(tok.href) : '#';
-          return `<a href="${safeHref}">${safe}</a>`;
+          return `<a href="${safeHref}">${innerHtml}</a>`;
         }
         default:
           return safe;
@@ -560,12 +739,16 @@ function blocksToHtml(blocks: MarkdownBlock[], align?: TextAlign): string {
           return `<blockquote${alignAttr}>${block.lines
             .map((line) => `<p>${inlineTokensToHtml(line)}</p>`)
             .join('')}</blockquote>`;
+        case 'callout':
+          return `<blockquote data-callout="${block.kind}"${alignAttr}>${block.lines
+            .map((line) => `<p>${inlineTokensToHtml(line)}</p>`)
+            .join('')}</blockquote>`;
         case 'ul':
-          return `<ul>${block.items
+          return `<ul${alignAttr}>${block.items
             .map((item) => `<li>${inlineTokensToHtml(item)}</li>`)
             .join('')}</ul>`;
         case 'ol':
-          return `<ol>${block.items
+          return `<ol${alignAttr}>${block.items
             .map((item) => `<li>${inlineTokensToHtml(item)}</li>`)
             .join('')}</ol>`;
         case 'codeblock':
@@ -609,7 +792,6 @@ function serializeInlineNode(node: Node, isLastChild = false): string {
   const tag = el.tagName.toLowerCase();
 
   if (tag === 'br') {
-    // Preserve explicit line breaks from toolbar and non-trailing line breaks
     return el.hasAttribute('data-explicit-br') || !isLastChild ? '<br />' : '';
   }
 
@@ -639,7 +821,14 @@ function serializeInlineNode(node: Node, isLastChild = false): string {
       if (!trimmed) return '';
       const leading = inner.startsWith(' ') ? ' ' : '';
       const trailing = inner.endsWith(' ') ? ' ' : '';
-      return `${leading}*${trimmed}*${trailing}`;
+      return `${leading}_${trimmed}_${trailing}`;
+    }
+    case 'u': {
+      const trimmed = inner.trim();
+      if (!trimmed) return '';
+      const leading = inner.startsWith(' ') ? ' ' : '';
+      const trailing = inner.endsWith(' ') ? ' ' : '';
+      return `${leading}<span style="text-decoration: underline;">${trimmed}</span>${trailing}`;
     }
     case 'code': {
       const trimmed = inner.trim();
@@ -653,12 +842,31 @@ function serializeInlineNode(node: Node, isLastChild = false): string {
     }
     case 'font':
     case 'span': {
+      if (!inner.trim()) return inner;
+      let output = inner;
+      const isUnderline = /underline/i.test(
+        el.style?.textDecoration || el.style?.textDecorationLine || ''
+      );
+      const isItalic = el.style?.fontStyle === 'italic';
+      const isBold =
+        el.style?.fontWeight === 'bold' ||
+        Number(el.style?.fontWeight) >= 600;
       const rawColor = el.style?.color || el.getAttribute('color') || '';
       const hex = rawColor ? normalizeColorToHex(rawColor) : null;
-      if (hex && inner.trim()) {
-        return `<span style="color: ${hex}">${inner}</span>`;
+
+      if (isItalic) {
+        output = `_${output.trim()}_`;
       }
-      return inner;
+      if (isBold) {
+        output = `**${output.trim()}**`;
+      }
+      if (isUnderline) {
+        output = `<span style="text-decoration: underline;">${output}</span>`;
+      }
+      if (hex) {
+        output = `<span style="color: ${hex}">${output}</span>`;
+      }
+      return output;
     }
     default:
       return inner;
@@ -723,6 +931,12 @@ function serializeBlockNode(node: Node): string {
   }
 
   if (tag === 'blockquote') {
+    const calloutAttr = el.getAttribute('data-callout')?.toLowerCase();
+    const calloutTag =
+      calloutAttr === 'note' || calloutAttr === 'tip' || calloutAttr === 'important'
+        ? calloutAttr.toUpperCase()
+        : null;
+
     const childBlocks = Array.from(el.childNodes)
       .map(serializeBlockNode)
       .filter(Boolean)
@@ -734,11 +948,16 @@ function serializeBlockNode(node: Node): string {
         .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
         .join('')
         .trim();
-    if (!fallback) return '';
-    return fallback
+
+    if (!fallback && !calloutTag) return '';
+
+    const bodyLines = (fallback || '')
       .split('\n')
-      .map((line) => (line.trim() ? `> ${line.trim()}` : '>'))
-      .join('\n');
+      .map((line) => (line.trim() ? `> ${line.trim()}` : '>'));
+    const md = calloutTag
+      ? [`> [!${calloutTag}]`, ...bodyLines].join('\n')
+      : bodyLines.join('\n');
+    return wrapAlignedMarkdown(align, md);
   }
 
   if (tag === 'ul') {
@@ -753,7 +972,7 @@ function serializeBlockNode(node: Node): string {
         return text ? `- ${text}` : '';
       })
       .filter(Boolean);
-    return items.join('\n');
+    return wrapAlignedMarkdown(align, items.join('\n'));
   }
 
   if (tag === 'ol') {
@@ -768,7 +987,7 @@ function serializeBlockNode(node: Node): string {
         return text ? `${index + 1}. ${text}` : '';
       })
       .filter(Boolean);
-    return items.join('\n');
+    return wrapAlignedMarkdown(align, items.join('\n'));
   }
 
   if (tag === 'pre') {
@@ -892,13 +1111,40 @@ export function applyRawMarkdownFormat(
 
   if (action === 'italic') {
     const inner = selected || 'italic text';
-    const inserted = `*${inner}*`;
+    const inserted = `_${inner}_`;
     const nextValue =
       value.slice(0, selectionStart) + inserted + value.slice(selectionEnd);
     return {
       nextValue,
       nextStart: selectionStart + 1,
       nextEnd: selectionStart + 1 + inner.length,
+    };
+  }
+
+  if (action === 'underline') {
+    const unwrapMatch =
+      /^<span\s+style=["']\s*text-decoration\s*:\s*underline\s*;?\s*["']\s*>([\s\S]*)<\/span>$/i.exec(
+        selected
+      );
+    if (unwrapMatch) {
+      const unwrapped = unwrapMatch[1];
+      const nextValue =
+        value.slice(0, selectionStart) + unwrapped + value.slice(selectionEnd);
+      return {
+        nextValue,
+        nextStart: selectionStart,
+        nextEnd: selectionStart + unwrapped.length,
+      };
+    }
+    const inner = selected || 'underlined text';
+    const prefix = '<span style="text-decoration: underline;">';
+    const inserted = `${prefix}${inner}</span>`;
+    const nextValue =
+      value.slice(0, selectionStart) + inserted + value.slice(selectionEnd);
+    return {
+      nextValue,
+      nextStart: selectionStart + prefix.length,
+      nextEnd: selectionStart + prefix.length + inner.length,
     };
   }
 
@@ -945,7 +1191,10 @@ export function applyRawMarkdownFormat(
   }
 
   if (action === 'color') {
-    const hex = options?.color && isSafeHexColor(options.color) ? options.color : '#2563EB';
+    const hex =
+      options?.color && isSafeHexColor(options.color)
+        ? options.color.toLowerCase()
+        : '#2d1f3d';
     const cleanSelected = selected.replace(
       /^<span\s+style=["']\s*color:\s*#[0-9a-fA-F]{3,8}\s*;?\s*["']\s*>([\s\S]*)<\/span>$/i,
       '$1'
@@ -1012,7 +1261,9 @@ export function applyRawMarkdownFormat(
   }
 
   if (action === 'mathBlock') {
-    const inner = (options?.formula ?? selected) || '\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}';
+    const inner =
+      (options?.formula ?? selected) ||
+      '\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}';
     const prefix = selectionStart > 0 && value[selectionStart - 1] !== '\n' ? '\n\n' : '';
     const suffix = selectionEnd < value.length && value[selectionEnd] !== '\n' ? '\n\n' : '';
     const inserted = `${prefix}$$\n${inner}\n$$${suffix}`;
@@ -1038,7 +1289,10 @@ export function applyRawMarkdownFormat(
     action === 'alignRight'
   ) {
     const unwrapped = blockSlice
-      .replace(/^<(?:div|p)\s+(?:style=["']\s*text-align:\s*(?:left|center|right)\s*;?\s*["']|align=["'](?:left|center|right)["'])\s*>\s*\n*/i, '')
+      .replace(
+        /^<(?:div|p)\s+(?:style=["']\s*text-align:\s*(?:left|center|right)\s*;?\s*["']|align=["'](?:left|center|right)["'])\s*>\s*\n*/i,
+        ''
+      )
       .replace(/\n*<\/(?:div|p)>$/i, '')
       .trim();
     const content = unwrapped || 'Aligned text';
@@ -1079,6 +1333,40 @@ export function applyRawMarkdownFormat(
       const stripped = line.replace(/^>\s?/, '');
       return `> ${stripped || 'Quote'}`;
     });
+  } else if (
+    action === 'calloutNote' ||
+    action === 'calloutTip' ||
+    action === 'calloutImportant'
+  ) {
+    const tag =
+      action === 'calloutNote'
+        ? 'NOTE'
+        : action === 'calloutTip'
+          ? 'TIP'
+          : 'IMPORTANT';
+    const placeholder =
+      action === 'calloutNote'
+        ? 'Useful information readers should know.'
+        : action === 'calloutTip'
+          ? 'Helpful advice for doing things better or more easily.'
+          : 'Key information readers need to know.';
+    const cleaned = lines
+      .map((line) =>
+        line
+          .replace(/^>\s*/, '')
+          .replace(/^\[!(NOTE|TIP|IMPORTANT)\]\s*/i, '')
+          .trim()
+      )
+      .filter(Boolean);
+    const bodyLines = cleaned.length > 0 ? cleaned : [placeholder];
+    const replacement = `> [!${tag}]\n${bodyLines.map((l) => `> ${l}`).join('\n')}`;
+    const nextValue =
+      value.slice(0, lineStart) + replacement + value.slice(lineEnd);
+    return {
+      nextValue,
+      nextStart: lineStart + `> [!${tag}]\n> `.length,
+      nextEnd: lineStart + replacement.length,
+    };
   }
 
   const replacement = transformedLines.join('\n');

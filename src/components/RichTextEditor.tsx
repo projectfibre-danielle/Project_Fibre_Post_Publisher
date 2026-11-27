@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import katex from 'katex';
 import {
+  AlertCircle,
   AlignCenter,
   AlignLeft,
   AlignRight,
@@ -13,7 +14,9 @@ import {
   Heading2,
   Heading3,
   Image as ImageIcon,
+  Info,
   Italic,
+  Lightbulb,
   Link2,
   List,
   ListOrdered,
@@ -22,6 +25,7 @@ import {
   Quote,
   Sigma,
   SquareFunction,
+  Underline,
   Video,
 } from 'lucide-react';
 import {
@@ -59,6 +63,7 @@ const SANITIZE_ALLOWED_TAGS = new Set([
   'b',
   'em',
   'i',
+  'u',
   'ul',
   'ol',
   'li',
@@ -131,7 +136,6 @@ function clearColorFromRichSelection(root: HTMLElement): void {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0) return;
 
-  // Strip color style from any span/font nodes intersecting the selection
   const range = sel.getRangeAt(0);
   const candidates = Array.from(root.querySelectorAll('span[style], font'));
   let changed = false;
@@ -182,6 +186,10 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   const lastEmittedRef = useRef<string>(value);
 
   const [activePopover, setActivePopover] = useState<ActivePopover>('none');
+
+  // Color selector state (with Project Fibre brand swatches #2d1f3d & #e8b4c8)
+  const [customColor, setCustomColor] = useState('#2d1f3d');
+  const [hexInput, setHexInput] = useState('#2d1f3d');
 
   // Link popover state
   const [linkUrl, setLinkUrl] = useState('https://');
@@ -368,7 +376,6 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
       return;
     }
 
-    // Rich text mode formatting
     if (!richRef.current) return;
     richRef.current.focus();
 
@@ -378,6 +385,9 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         break;
       case 'italic':
         document.execCommand('italic', false);
+        break;
+      case 'underline':
+        document.execCommand('underline', false);
         break;
       case 'h1':
         document.execCommand('formatBlock', false, 'h1');
@@ -436,13 +446,144 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
       case 'clearColor':
         clearColorFromRichSelection(richRef.current);
         break;
+      case 'calloutNote':
+      case 'calloutTip':
+      case 'calloutImportant': {
+        const kind =
+          action === 'calloutNote'
+            ? 'note'
+            : action === 'calloutTip'
+              ? 'tip'
+              : 'important';
+        const placeholder =
+          kind === 'note'
+            ? 'Useful information readers should know.'
+            : kind === 'tip'
+              ? 'Helpful advice for doing things better or more easily.'
+              : 'Key information readers need to know.';
+
+        const sel = window.getSelection();
+        const anchorNode = sel?.anchorNode ?? null;
+        const anchorEl =
+          anchorNode instanceof Element ? anchorNode : anchorNode?.parentElement;
+        const existingQuote = anchorEl?.closest('blockquote');
+
+        if (existingQuote && richRef.current.contains(existingQuote)) {
+          if (existingQuote.getAttribute('data-callout') === kind) {
+            const parent = existingQuote.parentNode;
+            if (parent) {
+              const firstInserted = existingQuote.firstChild;
+              while (existingQuote.firstChild) {
+                const child = existingQuote.firstChild;
+                if (child.nodeType === Node.TEXT_NODE) {
+                  const p = document.createElement('p');
+                  p.textContent = child.textContent;
+                  parent.insertBefore(p, existingQuote);
+                  existingQuote.removeChild(child);
+                } else {
+                  parent.insertBefore(child, existingQuote);
+                }
+              }
+              parent.removeChild(existingQuote);
+              if (firstInserted && sel) {
+                const r = document.createRange();
+                r.selectNodeContents(firstInserted);
+                r.collapse(false);
+                sel.removeAllRanges();
+                sel.addRange(r);
+              }
+            }
+          } else {
+            existingQuote.setAttribute('data-callout', kind);
+          }
+          break;
+        }
+
+        const bq = document.createElement('blockquote');
+        bq.setAttribute('data-callout', kind);
+        const p = document.createElement('p');
+
+        const selectedText = sel?.toString().trim() ?? '';
+        const currentBlock = anchorEl?.closest('p, div, h1, h2, h3');
+        const isDirectEditableBlock =
+          currentBlock &&
+          currentBlock !== richRef.current &&
+          richRef.current.contains(currentBlock);
+
+        if (selectedText) {
+          p.textContent = selectedText;
+          bq.appendChild(p);
+          if (sel && sel.rangeCount > 0) {
+            const range = sel.getRangeAt(0);
+            range.deleteContents();
+            range.insertNode(bq);
+          } else {
+            richRef.current.appendChild(bq);
+          }
+          if (sel) {
+            const r = document.createRange();
+            r.selectNodeContents(p);
+            r.collapse(false);
+            sel.removeAllRanges();
+            sel.addRange(r);
+          }
+        } else if (isDirectEditableBlock) {
+          const existingText = currentBlock.textContent?.trim() ?? '';
+          if (existingText) {
+            while (currentBlock.firstChild) {
+              p.appendChild(currentBlock.firstChild);
+            }
+          } else {
+            p.textContent = placeholder;
+          }
+          bq.appendChild(p);
+          currentBlock.parentNode?.replaceChild(bq, currentBlock);
+
+          if (!bq.nextElementSibling) {
+            const trailing = document.createElement('p');
+            trailing.appendChild(document.createElement('br'));
+            bq.parentNode?.appendChild(trailing);
+          }
+
+          if (sel) {
+            const r = document.createRange();
+            r.selectNodeContents(p);
+            if (existingText) r.collapse(false);
+            sel.removeAllRanges();
+            sel.addRange(r);
+          }
+        } else {
+          p.textContent = placeholder;
+          bq.appendChild(p);
+          richRef.current.appendChild(bq);
+          if (!bq.nextElementSibling) {
+            const trailing = document.createElement('p');
+            trailing.appendChild(document.createElement('br'));
+            richRef.current.appendChild(trailing);
+          }
+          if (sel) {
+            const r = document.createRange();
+            r.selectNodeContents(p);
+            sel.removeAllRanges();
+            sel.addRange(r);
+          }
+        }
+        break;
+      }
     }
 
     syncRichToMarkdown();
   };
 
-  const handleApplyColor = (hex: string) => {
-    if (!isSafeHexColor(hex)) return;
+  const handleApplyColor = (rawHex: string) => {
+    const trimmed = rawHex.trim();
+    const withHash = trimmed.startsWith('#') ? trimmed : `#${trimmed}`;
+    if (!isSafeHexColor(withHash)) return;
+    const hex = withHash.toLowerCase();
+
+    setCustomColor(hex);
+    setHexInput(hex);
+
     if (editorMode === 'raw') {
       const sel = savedRawSelectionRef.current ?? {
         start: value.length,
@@ -715,18 +856,23 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   };
 
   const stats = calculateReadingStats(value);
+  const isHexValid = isSafeHexColor(
+    hexInput.trim().startsWith('#') ? hexInput.trim() : `#${hexInput.trim()}`
+  );
 
   const toolbarGroups: Array<
     Array<{
       action: FormatAction;
       label: string;
+      shortLabel?: string;
       icon: React.ReactNode;
       popover?: ActivePopover;
     }>
   > = [
     [
-      { action: 'bold', label: 'Bold', icon: <Bold className="h-4 w-4" /> },
-      { action: 'italic', label: 'Italic', icon: <Italic className="h-4 w-4" /> },
+      { action: 'bold', label: 'Bold (**text**)', icon: <Bold className="h-4 w-4" /> },
+      { action: 'italic', label: 'Italic (_text_)', icon: <Italic className="h-4 w-4" /> },
+      { action: 'underline', label: 'Underline', icon: <Underline className="h-4 w-4" /> },
       { action: 'h1', label: 'Heading 1', icon: <Heading1 className="h-4 w-4" /> },
       { action: 'h2', label: 'Heading 2', icon: <Heading2 className="h-4 w-4" /> },
       { action: 'h3', label: 'Heading 3', icon: <Heading3 className="h-4 w-4" /> },
@@ -735,12 +881,45 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
       { action: 'blockquote', label: 'Blockquote', icon: <Quote className="h-4 w-4" /> },
     ],
     [
+      {
+        action: 'calloutNote',
+        label: 'Insert Note Callout (> [!NOTE])',
+        shortLabel: 'Note',
+        icon: <Info className="h-3.5 w-3.5 text-[#2563EB]" />,
+      },
+      {
+        action: 'calloutTip',
+        label: 'Insert Tip Callout (> [!TIP])',
+        shortLabel: 'Tip',
+        icon: <Lightbulb className="h-3.5 w-3.5 text-[#059669]" />,
+      },
+      {
+        action: 'calloutImportant',
+        label: 'Insert Important Callout (> [!IMPORTANT])',
+        shortLabel: 'Important',
+        icon: <AlertCircle className="h-3.5 w-3.5 text-[#7C3AED]" />,
+      },
+    ],
+    [
       { action: 'alignLeft', label: 'Align Left', icon: <AlignLeft className="h-4 w-4" /> },
       { action: 'alignCenter', label: 'Align Center', icon: <AlignCenter className="h-4 w-4" /> },
       { action: 'alignRight', label: 'Align Right', icon: <AlignRight className="h-4 w-4" /> },
     ],
     [
-      { action: 'color', label: 'Text Color', icon: <Palette className="h-4 w-4" />, popover: 'color' },
+      {
+        action: 'color',
+        label: 'Text Color',
+        icon: (
+          <span className="flex flex-col items-center">
+            <Palette className="h-3.5 w-3.5" />
+            <span
+              className="mt-0.5 h-0.5 w-3.5 rounded-full"
+              style={{ backgroundColor: customColor }}
+            />
+          </span>
+        ),
+        popover: 'color',
+      },
     ],
     [
       { action: 'hr', label: 'Insert Horizontal Line (---)', icon: <Minus className="h-4 w-4" /> },
@@ -757,8 +936,8 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
 
   return (
     <div className="flex flex-col rounded-xl border border-[#E4E4E7] bg-white">
-      {/* Toolbar */}
-      <div className="relative flex flex-wrap items-center justify-between gap-2 border-b border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 rounded-t-xl">
+      {/* Sticky Formatting Toolbar */}
+      <div className="sticky top-[57px] z-20 flex flex-wrap items-center justify-between gap-2 rounded-t-xl border-b border-[#E4E4E7] bg-[#FAFAFA]/95 px-3 py-2 backdrop-blur-xs">
         <div
           className="flex flex-wrap items-center gap-1"
           role="toolbar"
@@ -796,13 +975,16 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
                           applyFormat(btn.action);
                         }
                       }}
-                      className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#2563EB] ${
+                      className={`flex h-8 items-center justify-center rounded-lg whitespace-nowrap shrink-0 transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#2563EB] ${
+                        btn.shortLabel ? 'gap-1 px-2 text-xs font-medium' : 'w-8'
+                      } ${
                         isActive
                           ? 'bg-[#2563EB]/10 text-[#2563EB]'
                           : 'text-[#52525B] hover:bg-[#E4E4E7]/70 hover:text-[#18181B]'
                       }`}
                     >
                       {btn.icon}
+                      {btn.shortLabel && <span>{btn.shortLabel}</span>}
                     </button>
                   );
                 })}
@@ -839,11 +1021,13 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
           </button>
         </div>
 
-        {/* Text Color Swatch Popover */}
+        {/* Customizable Text Color Popover */}
         {activePopover === 'color' && (
-          <div className="absolute top-full left-3 z-20 mt-2 w-[min(300px,calc(100vw-2rem))] rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg">
+          <div className="absolute top-full left-3 z-30 mt-2 w-[min(320px,calc(100vw-2rem))] rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg">
             <div className="mb-2.5 flex items-center justify-between">
-              <span className="text-xs font-semibold text-[#18181B]">Text Color</span>
+              <span className="text-xs font-semibold text-[#18181B]">
+                Text Color
+              </span>
               <button
                 type="button"
                 onClick={handleClearColor}
@@ -853,19 +1037,71 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
                 Clear Color
               </button>
             </div>
-            <div className="grid grid-cols-7 gap-2">
+
+            {/* Brand & Editorial Swatches */}
+            <div className="grid grid-cols-8 gap-1.5">
               {PRESET_TEXT_COLORS.map((swatch) => (
                 <button
                   key={swatch.hex}
                   type="button"
-                  title={swatch.name}
+                  title={`${swatch.name} (${swatch.hex})`}
                   aria-label={`Apply ${swatch.name}`}
                   onClick={() => handleApplyColor(swatch.hex)}
-                  className="h-7 w-7 rounded-lg border border-black/10 transition-transform hover:scale-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2563EB]"
+                  className="h-7 w-7 rounded-lg border border-black/15 transition-transform hover:scale-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2563EB]"
                   style={{ backgroundColor: swatch.hex }}
                 />
               ))}
             </div>
+
+            {/* Custom Color Input & Picker */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleApplyColor(hexInput);
+              }}
+              className="mt-3 flex items-center gap-2 border-t border-[#E4E4E7] pt-3"
+            >
+              <label
+                htmlFor="custom-color-picker"
+                className="sr-only"
+              >
+                Pick custom color
+              </label>
+              <input
+                id="custom-color-picker"
+                type="color"
+                value={isSafeHexColor(customColor) ? customColor : '#2d1f3d'}
+                onChange={(e) => {
+                  setCustomColor(e.target.value);
+                  setHexInput(e.target.value);
+                }}
+                className="h-8 w-9 cursor-pointer rounded-md border border-[#E4E4E7] bg-white p-0.5"
+              />
+              <input
+                type="text"
+                value={hexInput}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setHexInput(val);
+                  const normalized = val.trim().startsWith('#')
+                    ? val.trim()
+                    : `#${val.trim()}`;
+                  if (isSafeHexColor(normalized)) {
+                    setCustomColor(normalized.toLowerCase());
+                  }
+                }}
+                placeholder="#2d1f3d"
+                aria-label="Custom hex color"
+                className="min-w-0 flex-1 rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-2.5 py-1.5 font-mono text-xs text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={!isHexValid}
+                className="rounded-lg bg-[#18181B] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#27272A] disabled:opacity-40 whitespace-nowrap shrink-0"
+              >
+                Apply
+              </button>
+            </form>
           </div>
         )}
 
@@ -873,7 +1109,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         {activePopover === 'link' && (
           <form
             onSubmit={handleInsertLink}
-            className="absolute top-full left-3 z-20 mt-2 flex w-[min(360px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
+            className="absolute top-full left-3 z-30 mt-2 flex w-[min(360px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
           >
             <div className="text-xs font-semibold text-[#18181B]">Insert Link</div>
             <input
@@ -914,7 +1150,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         {activePopover === 'image' && (
           <form
             onSubmit={handleInsertImage}
-            className="absolute top-full left-3 z-20 mt-2 flex w-[min(380px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
+            className="absolute top-full left-3 z-30 mt-2 flex w-[min(380px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
           >
             <div className="text-xs font-semibold text-[#18181B]">
               Insert Image or GIF
@@ -957,7 +1193,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         {activePopover === 'video' && (
           <form
             onSubmit={handleInsertVideo}
-            className="absolute top-full left-3 z-20 mt-2 flex w-[min(400px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
+            className="absolute top-full left-3 z-30 mt-2 flex w-[min(400px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
           >
             <div className="text-xs font-semibold text-[#18181B]">
               Insert Video (YouTube, Vimeo, or MP4)
@@ -979,7 +1215,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
               className="rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-1.5 text-sm text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
             />
             {resolvedVideoPreview && (
-              <p className="font-mono text-[11px] text-[#71717A] truncate">
+              <p className="truncate font-mono text-[11px] text-[#71717A]">
                 {resolvedVideoPreview.kind === 'iframe'
                   ? `Embed URL: ${resolvedVideoPreview.embedSrc}`
                   : `Direct video: ${resolvedVideoPreview.embedSrc}`}
@@ -1008,7 +1244,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         {activePopover === 'math' && (
           <form
             onSubmit={handleInsertMath}
-            className="absolute top-full left-3 z-20 mt-2 flex w-[min(420px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
+            className="absolute top-full left-3 z-30 mt-2 flex w-[min(420px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
           >
             <div className="flex items-center justify-between gap-2">
               <span className="text-xs font-semibold text-[#18181B]">
@@ -1075,8 +1311,8 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         )}
       </div>
 
-      {/* Editor Surface */}
-      <div className="min-h-[420px] p-5 sm:p-6">
+      {/* Scrollable Editor Surface */}
+      <div className="h-[clamp(400px,58vh,680px)] overflow-y-auto scroll-smooth p-5 sm:p-6">
         {editorMode === 'rich' ? (
           <div
             ref={richRef}
@@ -1085,8 +1321,8 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
             onInput={syncRichToMarkdown}
             onBlur={syncRichToMarkdown}
             onPaste={handleRichPaste}
-            data-placeholder="Write your Project Fibre story here. Use the toolbar above for headings, alignment, colors, media, and math — everything converts cleanly to Markdown..."
-            className="rich-editor-surface min-h-[380px] text-[15.5px] leading-[1.75] text-[#18181B] focus:outline-none"
+            data-placeholder="Write your Project Fibre story here. Use the sticky toolbar above for headings, underline, alignment, colors, media, and math — everything converts cleanly to Markdown..."
+            className="rich-editor-surface min-h-full text-[15.5px] leading-[1.75] text-[#18181B] focus:outline-none"
           />
         ) : (
           <textarea
@@ -1098,20 +1334,21 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
             }}
             placeholder="# Heading&#10;&#10;Write or inspect clean Markdown directly..."
             spellCheck
-            className="min-h-[380px] w-full resize-y bg-transparent font-mono text-[13.5px] leading-[1.75] text-[#18181B] placeholder:text-[#A1A1AA] focus:outline-none"
+            className="h-full min-h-full w-full resize-none bg-transparent font-mono text-[13.5px] leading-[1.75] text-[#18181B] placeholder:text-[#A1A1AA] focus:outline-none"
           />
         )}
       </div>
 
       {/* Subtle Bottom Editor Footer */}
-      <div className="flex items-center justify-between border-t border-[#E4E4E7] bg-[#FAFAFA] px-4 py-2 text-[12px] text-[#71717A] rounded-b-xl tabular-nums">
+      <div className="flex items-center justify-between rounded-b-xl border-t border-[#E4E4E7] bg-[#FAFAFA] px-4 py-2 text-[12px] text-[#71717A] tabular-nums">
         <span>
           {editorMode === 'rich'
             ? 'Rich Text mode (auto-syncing to Markdown)'
             : 'Raw Markdown mode'}
         </span>
         <span>
-          {stats.words} words · {stats.minutes > 0 ? `${stats.minutes} min read` : '0 min read'}
+          {stats.words} words ·{' '}
+          {stats.minutes > 0 ? `${stats.minutes} min read` : '0 min read'}
         </span>
       </div>
     </div>

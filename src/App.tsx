@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Columns2, Eye, PenLine, RotateCcw, Send } from 'lucide-react';
+import { Bookmark, Columns2, Eye, PenLine, RotateCcw, Send } from 'lucide-react';
+import { DraftsDrawer } from './components/DraftsDrawer';
 import { MarkdownPreview } from './components/MarkdownPreview';
 import { PostsManagerDrawer } from './components/PostsManagerDrawer';
 import { EditorMode, RichTextEditor } from './components/RichTextEditor';
@@ -10,6 +11,7 @@ import {
   DraftPost,
   GitHubSettings,
   PublishStatus,
+  SavedDraft,
 } from './types/blog';
 import {
   deletePostFromGitHub,
@@ -19,11 +21,17 @@ import {
 } from './utils/github';
 import {
   createEmptyDraft,
+  deleteSavedDraftById,
   loadDraftPost,
   loadGitHubSettings,
+  loadRemoveDraftOnPublishPref,
+  loadSavedDrafts,
+  markSavedDraftPublished,
   saveDraftPost,
   saveGitHubSettings,
+  saveRemoveDraftOnPublishPref,
   slugify,
+  upsertSavedDraft,
 } from './utils/storage';
 
 type WorkspacePane = 'split' | 'editor' | 'preview';
@@ -44,6 +52,14 @@ export default function App() {
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [postsDrawerOpen, setPostsDrawerOpen] = useState(false);
+  const [draftsDrawerOpen, setDraftsDrawerOpen] = useState(false);
+
+  const [savedDrafts, setSavedDrafts] = useState<SavedDraft[]>(() =>
+    loadSavedDrafts()
+  );
+  const [removeDraftOnPublish, setRemoveDraftOnPublish] = useState<boolean>(() =>
+    loadRemoveDraftOnPublishPref()
+  );
 
   const [remotePosts, setRemotePosts] = useState<BlogPost[]>([]);
   const [loadingPosts, setLoadingPosts] = useState(false);
@@ -145,6 +161,7 @@ export default function App() {
     }
 
     setDraft({
+      activeDraftId: null,
       editingId: post.id,
       title: post.title,
       slug: post.slug,
@@ -232,7 +249,66 @@ export default function App() {
     setStatus({ type: 'idle', title: '', message: '' });
   };
 
-  const handlePublish = async () => {
+  const handleSaveDraftLocally = () => {
+    if (!draft.title.trim() && !draft.content.trim() && !draft.summary.trim()) {
+      setStatus({
+        type: 'error',
+        title: 'Nothing to save yet',
+        message: 'Add a title, summary, or post content before saving a local draft.',
+      });
+      return;
+    }
+
+    const { drafts, saved } = upsertSavedDraft(draft);
+    setSavedDrafts(drafts);
+    setDraft((prev) => ({
+      ...prev,
+      activeDraftId: saved.draftId,
+    }));
+
+    setStatus({
+      type: 'success',
+      title: `Saved draft "${saved.title.trim() || 'Untitled Draft'}" locally`,
+      message: 'Stored in browser localStorage only. Not published or committed to src/data/posts.json.',
+    });
+  };
+
+  const handleOpenSavedDraft = (saved: SavedDraft) => {
+    setDraft({
+      activeDraftId: saved.draftId,
+      editingId: saved.editingId,
+      title: saved.title,
+      slug: saved.slug,
+      date: saved.date || new Date().toISOString().slice(0, 10),
+      categoryTags: saved.categoryTags,
+      summary: saved.summary,
+      content: saved.content,
+      createdAt: saved.createdAt,
+      extraFields: saved.extraFields,
+    });
+    setSlugTouched(Boolean(saved.slug && saved.slug !== slugify(saved.title)));
+    setSyncVersion((v) => v + 1);
+    setStatus({
+      type: 'idle',
+      title: '',
+      message: '',
+    });
+  };
+
+  const handleDeleteSavedDraft = (draftId: string) => {
+    const next = deleteSavedDraftById(draftId);
+    setSavedDrafts(next);
+    if (draft.activeDraftId === draftId) {
+      setDraft((prev) => ({ ...prev, activeDraftId: null }));
+    }
+  };
+
+  const handleToggleRemoveOnPublish = (next: boolean) => {
+    setRemoveDraftOnPublish(next);
+    saveRemoveDraftOnPublishPref(next);
+  };
+
+  const publishDraftPayload = async (targetDraft: DraftPost) => {
     if (!settings.owner.trim() || !settings.token.trim()) {
       setSettingsOpen(true);
       setStatus({
@@ -247,18 +323,20 @@ export default function App() {
     setPublishing(true);
     setStatus({
       type: 'loading',
-      title: draft.editingId ? 'Updating post on GitHub' : 'Publishing post to GitHub',
+      title: targetDraft.editingId ? 'Updating post on GitHub' : 'Publishing post to GitHub',
       message: `Connecting to ${settings.owner}/${settings.repo}...`,
     });
 
     try {
       const { result, savedPost, wasUpdate } = await publishPostToGitHub(
         settings,
-        draft,
+        targetDraft,
         (step) => {
           setStatus({
             type: 'loading',
-            title: draft.editingId ? 'Updating post on GitHub' : 'Publishing post to GitHub',
+            title: targetDraft.editingId
+              ? 'Updating post on GitHub'
+              : 'Publishing post to GitHub',
             message: step,
           });
         }
@@ -266,13 +344,35 @@ export default function App() {
 
       setRemotePosts(result.posts);
       setHasLoadedPosts(true);
-      setDraft((prev) => ({
-        ...prev,
-        editingId: savedPost.id,
-        slug: savedPost.slug,
-        createdAt: savedPost.createdAt ?? null,
-      }));
-      setSlugTouched(true);
+
+      let nextActiveDraftId = targetDraft.activeDraftId ?? null;
+      if (targetDraft.activeDraftId) {
+        if (removeDraftOnPublish) {
+          const updatedDrafts = deleteSavedDraftById(targetDraft.activeDraftId);
+          setSavedDrafts(updatedDrafts);
+          nextActiveDraftId = null;
+        } else {
+          const updatedDrafts = markSavedDraftPublished(
+            targetDraft.activeDraftId,
+            savedPost.id
+          );
+          setSavedDrafts(updatedDrafts);
+        }
+      }
+
+      if (
+        targetDraft.activeDraftId === draft.activeDraftId ||
+        targetDraft === draft
+      ) {
+        setDraft((prev) => ({
+          ...prev,
+          activeDraftId: nextActiveDraftId,
+          editingId: savedPost.id,
+          slug: savedPost.slug,
+          createdAt: savedPost.createdAt ?? null,
+        }));
+        setSlugTouched(true);
+      }
 
       setStatus({
         type: 'success',
@@ -313,8 +413,17 @@ export default function App() {
               : 'Unexpected network error while publishing to GitHub.',
         });
       }
+      throw err;
     } finally {
       setPublishing(false);
+    }
+  };
+
+  const handlePublish = async () => {
+    try {
+      await publishDraftPayload(draft);
+    } catch {
+      // Status banner already displays the error
     }
   };
 
@@ -359,17 +468,17 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={handleLoadExistingPosts}
-              className="hover:text-[#18181B] hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
+              onClick={() => setDraftsDrawerOpen(true)}
+              className="hover:text-[#18181B] hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0 tabular-nums"
             >
-              Load Existing Posts
+              {savedDrafts.length > 0 ? `Drafts (${savedDrafts.length})` : 'Drafts'}
             </button>
             <button
               type="button"
-              onClick={handleNewDraft}
+              onClick={handleLoadExistingPosts}
               className="hover:text-[#18181B] hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
             >
-              New Draft
+              Posts
             </button>
             <button
               type="button"
@@ -393,7 +502,9 @@ export default function App() {
                 ? 'Publishing...'
                 : draft.editingId
                   ? 'Update on GitHub'
-                  : 'Publish to GitHub'}
+                  : draft.activeDraftId
+                    ? 'Publish Draft to GitHub'
+                    : 'Publish to GitHub'}
             </button>
           </div>
         </div>
@@ -441,6 +552,15 @@ export default function App() {
               </button>
             )}
 
+            {draft.activeDraftId && !draft.editingId && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="font-medium text-[#2d1f3d]">
+                  Local draft
+                </span>
+              </>
+            )}
+
             {draft.editingId && (
               <>
                 <span aria-hidden="true">·</span>
@@ -459,7 +579,22 @@ export default function App() {
             )}
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              onClick={handleSaveDraftLocally}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs font-medium text-[#18181B] transition-colors hover:bg-[#F4F4F5] whitespace-nowrap shrink-0"
+            >
+              <Bookmark className="h-3.5 w-3.5 text-[#52525B]" />
+              Save Draft
+            </button>
+            <button
+              type="button"
+              onClick={handleNewDraft}
+              className="rounded-lg border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs font-medium text-[#52525B] transition-colors hover:bg-[#F4F4F5] hover:text-[#18181B] whitespace-nowrap shrink-0"
+            >
+              New Draft
+            </button>
             <button
               type="button"
               onClick={handleLoadExistingPosts}
@@ -664,7 +799,7 @@ export default function App() {
               aria-label="Live Article Preview"
               className={
                 workspacePane === 'split'
-                  ? 'lg:col-span-5 lg:sticky lg:top-20 rounded-xl border border-[#E4E4E7] bg-white p-6 sm:p-8'
+                  ? 'lg:col-span-5 lg:sticky lg:top-20 lg:max-h-[calc(100vh-6.5rem)] lg:overflow-y-auto scroll-smooth rounded-xl border border-[#E4E4E7] bg-white p-6 sm:p-8'
                   : 'rounded-xl border border-[#E4E4E7] bg-white p-6 sm:p-10'
               }
             >
@@ -694,6 +829,19 @@ export default function App() {
         settings={settings}
         onSave={handleSaveSettings}
         onAuthErrorDetected={handleAuthError}
+      />
+
+      {/* Local Drafts Drawer */}
+      <DraftsDrawer
+        isOpen={draftsDrawerOpen}
+        onClose={() => setDraftsDrawerOpen(false)}
+        drafts={savedDrafts}
+        activeDraftId={draft.activeDraftId ?? null}
+        removeDraftOnPublish={removeDraftOnPublish}
+        onToggleRemoveOnPublish={handleToggleRemoveOnPublish}
+        onOpenDraft={handleOpenSavedDraft}
+        onPublishDraft={publishDraftPayload}
+        onDeleteDraft={handleDeleteSavedDraft}
       />
 
       {/* Load Existing Posts Drawer */}

@@ -87,6 +87,53 @@
   color: #3F3F46;
 }
 
+.rich-editor-surface blockquote[data-callout] {
+  font-family: var(--font-sans);
+  font-style: normal;
+  border: 1px solid #E4E4E7;
+  padding: 0.9rem 1.15rem;
+}
+
+.rich-editor-surface blockquote[data-callout]::before {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.rich-editor-surface blockquote[data-callout="note"] {
+  background-color: #EFF6FF;
+  border-color: #BFDBFE;
+  color: #1E3A8A;
+}
+
+.rich-editor-surface blockquote[data-callout="note"]::before {
+  content: "Note";
+  color: #1D4ED8;
+}
+
+.rich-editor-surface blockquote[data-callout="tip"] {
+  background-color: #ECFDF5;
+  border-color: #A7F3D0;
+  color: #064E3B;
+}
+
+.rich-editor-surface blockquote[data-callout="tip"]::before {
+  content: "Tip";
+  color: #047857;
+}
+
+.rich-editor-surface blockquote[data-callout="important"] {
+  background-color: #F5F3FF;
+  border-color: #DDD6FE;
+  color: #3B0764;
+}
+
+.rich-editor-surface blockquote[data-callout="important"]::before {
+  content: "Important";
+  color: #6D28D9;
+}
+
 .rich-editor-surface a {
   color: #2563EB;
   text-decoration: underline;
@@ -115,6 +162,11 @@
   border-radius: 0.5rem;
   margin: 1rem 0;
   border: 1px solid #E4E4E7;
+}
+
+.rich-editor-surface u {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .rich-editor-surface [data-video-embed="true"] {

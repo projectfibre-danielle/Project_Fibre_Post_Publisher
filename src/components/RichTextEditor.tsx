@@ -1,27 +1,44 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import katex from 'katex';
 import {
+  AlignCenter,
+  AlignLeft,
+  AlignRight,
   Bold,
   Code2,
+  CornerDownLeft,
+  Eraser,
   FileText,
   Heading1,
   Heading2,
   Heading3,
+  Image as ImageIcon,
   Italic,
   Link2,
   List,
   ListOrdered,
+  Minus,
+  Palette,
   Quote,
+  Sigma,
+  SquareFunction,
+  Video,
 } from 'lucide-react';
 import {
   applyRawMarkdownFormat,
   calculateReadingStats,
   domToMarkdown,
   FormatAction,
+  isSafeHexColor,
   isSafeUrl,
   markdownToSafeHtml,
+  PRESET_TEXT_COLORS,
+  resolveVideoEmbed,
 } from '../utils/markdown';
 
 export type EditorMode = 'rich' | 'raw';
+
+type ActivePopover = 'none' | 'link' | 'color' | 'image' | 'video' | 'math';
 
 interface RichTextEditorProps {
   value: string;
@@ -50,6 +67,8 @@ const SANITIZE_ALLOWED_TAGS = new Set([
   'code',
   'pre',
   'hr',
+  'img',
+  'span',
 ]);
 
 function sanitizePastedHtml(html: string): string {
@@ -69,7 +88,6 @@ function sanitizePastedHtml(html: string): string {
       return null;
     }
 
-    // Handle spans with bold/italic computed/inline styling
     if (!SANITIZE_ALLOWED_TAGS.has(tag)) {
       const fragment = document.createDocumentFragment();
       for (const child of Array.from(el.childNodes)) {
@@ -85,6 +103,13 @@ function sanitizePastedHtml(html: string): string {
       if (isSafeUrl(href)) {
         cleanEl.setAttribute('href', href);
       }
+    }
+    if (tag === 'img') {
+      const src = el.getAttribute('src') ?? '';
+      const alt = el.getAttribute('alt') ?? '';
+      if (!isSafeUrl(src)) return null;
+      cleanEl.setAttribute('src', src);
+      cleanEl.setAttribute('alt', alt);
     }
 
     for (const child of Array.from(el.childNodes)) {
@@ -102,6 +127,47 @@ function sanitizePastedHtml(html: string): string {
   return domToMarkdown(container);
 }
 
+function clearColorFromRichSelection(root: HTMLElement): void {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return;
+
+  // Strip color style from any span/font nodes intersecting the selection
+  const range = sel.getRangeAt(0);
+  const candidates = Array.from(root.querySelectorAll('span[style], font'));
+  let changed = false;
+
+  for (const el of candidates) {
+    if (range.intersectsNode(el)) {
+      if (el.tagName.toLowerCase() === 'font') {
+        const parent = el.parentNode;
+        if (parent) {
+          while (el.firstChild) {
+            parent.insertBefore(el.firstChild, el);
+          }
+          parent.removeChild(el);
+          changed = true;
+        }
+      } else if (el instanceof HTMLElement && el.style.color) {
+        el.style.removeProperty('color');
+        if (!el.getAttribute('style')?.trim()) {
+          const parent = el.parentNode;
+          if (parent) {
+            while (el.firstChild) {
+              parent.insertBefore(el.firstChild, el);
+            }
+            parent.removeChild(el);
+          }
+        }
+        changed = true;
+      }
+    }
+  }
+
+  if (!changed) {
+    document.execCommand('foreColor', false, '#18181B');
+  }
+}
+
 export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   value,
   onChange,
@@ -115,9 +181,23 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   const savedRawSelectionRef = useRef<{ start: number; end: number } | null>(null);
   const lastEmittedRef = useRef<string>(value);
 
-  const [linkPopoverOpen, setLinkPopoverOpen] = useState(false);
+  const [activePopover, setActivePopover] = useState<ActivePopover>('none');
+
+  // Link popover state
   const [linkUrl, setLinkUrl] = useState('https://');
   const [linkLabel, setLinkLabel] = useState('');
+
+  // Image/GIF popover state
+  const [imageUrl, setImageUrl] = useState('');
+  const [imageAlt, setImageAlt] = useState('');
+
+  // Video popover state
+  const [videoUrl, setVideoUrl] = useState('');
+  const [videoTitle, setVideoTitle] = useState('');
+
+  // Math popover state
+  const [mathMode, setMathMode] = useState<'inline' | 'block'>('inline');
+  const [mathFormula, setMathFormula] = useState('');
 
   // Hydrate rich text surface when switching into rich mode or loading a new draft/post
   useEffect(() => {
@@ -131,6 +211,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
 
   const handleModeSwitch = (nextMode: EditorMode) => {
     if (nextMode === editorMode) return;
+    setActivePopover('none');
     if (editorMode === 'rich' && richRef.current) {
       const latest = domToMarkdown(richRef.current);
       lastEmittedRef.current = latest;
@@ -170,39 +251,120 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
     }
   };
 
+  const insertHtmlAtRichCaret = (node: Node) => {
+    restoreRichSelection();
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && richRef.current?.contains(sel.anchorNode)) {
+      const range = sel.getRangeAt(0);
+      range.deleteContents();
+      range.insertNode(node);
+
+      const after = document.createRange();
+      after.setStartAfter(node);
+      after.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(after);
+    } else if (richRef.current) {
+      richRef.current.appendChild(node);
+    }
+    syncRichToMarkdown();
+  };
+
+  const getCurrentSelectedText = (): string => {
+    if (editorMode === 'rich') {
+      return window.getSelection()?.toString() ?? '';
+    }
+    if (rawRef.current) {
+      return value.slice(rawRef.current.selectionStart, rawRef.current.selectionEnd);
+    }
+    return '';
+  };
+
+  const openPopover = (popover: ActivePopover) => {
+    saveCurrentSelection();
+    setActivePopover((prev) => (prev === popover ? 'none' : popover));
+  };
+
+  const applyRawAction = (
+    action: FormatAction,
+    options?: {
+      url?: string;
+      label?: string;
+      color?: string;
+      formula?: string;
+    }
+  ) => {
+    const textarea = rawRef.current;
+    const saved = savedRawSelectionRef.current;
+    const start = textarea ? textarea.selectionStart : (saved?.start ?? value.length);
+    const end = textarea ? textarea.selectionEnd : (saved?.end ?? value.length);
+    const { nextValue, nextStart, nextEnd } = applyRawMarkdownFormat(
+      value,
+      start,
+      end,
+      action,
+      options
+    );
+    lastEmittedRef.current = nextValue;
+    onChange(nextValue);
+    requestAnimationFrame(() => {
+      if (rawRef.current) {
+        rawRef.current.focus();
+        rawRef.current.setSelectionRange(nextStart, nextEnd);
+      }
+    });
+  };
+
   const applyFormat = (action: FormatAction) => {
     if (action === 'link') {
-      saveCurrentSelection();
-      if (editorMode === 'rich') {
-        const sel = window.getSelection();
-        setLinkLabel(sel?.toString() ?? '');
-      } else if (rawRef.current) {
-        const { selectionStart, selectionEnd } = rawRef.current;
-        setLinkLabel(value.slice(selectionStart, selectionEnd));
-      }
+      setLinkLabel(getCurrentSelectedText());
       setLinkUrl('https://');
-      setLinkPopoverOpen(true);
+      openPopover('link');
       return;
     }
 
-    if (editorMode === 'raw') {
-      const textarea = rawRef.current;
-      const start = textarea ? textarea.selectionStart : value.length;
-      const end = textarea ? textarea.selectionEnd : value.length;
-      const { nextValue, nextStart, nextEnd } = applyRawMarkdownFormat(
-        value,
-        start,
-        end,
-        action
-      );
-      lastEmittedRef.current = nextValue;
-      onChange(nextValue);
-      requestAnimationFrame(() => {
-        if (rawRef.current) {
-          rawRef.current.focus();
-          rawRef.current.setSelectionRange(nextStart, nextEnd);
+    if (action === 'image') {
+      setImageAlt(getCurrentSelectedText());
+      setImageUrl('');
+      openPopover('image');
+      return;
+    }
+
+    if (action === 'video') {
+      setVideoTitle(getCurrentSelectedText());
+      setVideoUrl('');
+      openPopover('video');
+      return;
+    }
+
+    if (action === 'mathInline' || action === 'mathBlock') {
+      const selected = getCurrentSelectedText().trim();
+      const targetMode = action === 'mathBlock' ? 'block' : 'inline';
+      if (selected) {
+        if (editorMode === 'raw') {
+          applyRawAction(action, { formula: selected });
+        } else {
+          const textNode = document.createTextNode(
+            targetMode === 'block' ? `$$\n${selected}\n$$` : `$${selected}$`
+          );
+          insertHtmlAtRichCaret(textNode);
         }
-      });
+        return;
+      }
+      setMathMode(targetMode);
+      setMathFormula(
+        targetMode === 'inline'
+          ? 'E = mc^2'
+          : '\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}'
+      );
+      openPopover('math');
+      return;
+    }
+
+    setActivePopover('none');
+
+    if (editorMode === 'raw') {
+      applyRawAction(action);
       return;
     }
 
@@ -246,9 +408,106 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         );
         break;
       }
+      case 'alignLeft':
+        document.execCommand('justifyLeft', false);
+        break;
+      case 'alignCenter':
+        document.execCommand('justifyCenter', false);
+        break;
+      case 'alignRight':
+        document.execCommand('justifyRight', false);
+        break;
+      case 'hr': {
+        const frag = document.createDocumentFragment();
+        const hr = document.createElement('hr');
+        const p = document.createElement('p');
+        p.appendChild(document.createElement('br'));
+        frag.appendChild(hr);
+        frag.appendChild(p);
+        insertHtmlAtRichCaret(frag);
+        return;
+      }
+      case 'br': {
+        const br = document.createElement('br');
+        br.setAttribute('data-explicit-br', 'true');
+        insertHtmlAtRichCaret(br);
+        return;
+      }
+      case 'clearColor':
+        clearColorFromRichSelection(richRef.current);
+        break;
     }
 
     syncRichToMarkdown();
+  };
+
+  const handleApplyColor = (hex: string) => {
+    if (!isSafeHexColor(hex)) return;
+    if (editorMode === 'raw') {
+      const sel = savedRawSelectionRef.current ?? {
+        start: value.length,
+        end: value.length,
+      };
+      const { nextValue, nextStart, nextEnd } = applyRawMarkdownFormat(
+        value,
+        sel.start,
+        sel.end,
+        'color',
+        { color: hex }
+      );
+      lastEmittedRef.current = nextValue;
+      onChange(nextValue);
+      setActivePopover('none');
+      requestAnimationFrame(() => {
+        if (rawRef.current) {
+          rawRef.current.focus();
+          rawRef.current.setSelectionRange(nextStart, nextEnd);
+        }
+      });
+      return;
+    }
+
+    restoreRichSelection();
+    try {
+      document.execCommand('styleWithCSS', false, 'true');
+    } catch {
+      // Fallback handled by serializeInlineNode for <font> tags
+    }
+    document.execCommand('foreColor', false, hex);
+    setActivePopover('none');
+    syncRichToMarkdown();
+  };
+
+  const handleClearColor = () => {
+    if (editorMode === 'raw') {
+      const sel = savedRawSelectionRef.current ?? {
+        start: value.length,
+        end: value.length,
+      };
+      const { nextValue, nextStart, nextEnd } = applyRawMarkdownFormat(
+        value,
+        sel.start,
+        sel.end,
+        'clearColor'
+      );
+      lastEmittedRef.current = nextValue;
+      onChange(nextValue);
+      setActivePopover('none');
+      requestAnimationFrame(() => {
+        if (rawRef.current) {
+          rawRef.current.focus();
+          rawRef.current.setSelectionRange(nextStart, nextEnd);
+        }
+      });
+      return;
+    }
+
+    restoreRichSelection();
+    if (richRef.current) {
+      clearColorFromRichSelection(richRef.current);
+      syncRichToMarkdown();
+    }
+    setActivePopover('none');
   };
 
   const handleInsertLink = (e: React.FormEvent) => {
@@ -270,7 +529,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
       );
       lastEmittedRef.current = nextValue;
       onChange(nextValue);
-      setLinkPopoverOpen(false);
+      setActivePopover('none');
       requestAnimationFrame(() => {
         if (rawRef.current) {
           rawRef.current.focus();
@@ -285,25 +544,162 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
     const selectedText = sel?.toString().trim() ?? '';
     const displayLabel = linkLabel.trim() || selectedText || cleanUrl;
 
-    if (sel && sel.rangeCount > 0) {
-      const range = sel.getRangeAt(0);
-      range.deleteContents();
-      const anchor = document.createElement('a');
-      anchor.href = cleanUrl;
-      anchor.textContent = displayLabel;
-      range.insertNode(anchor);
+    const anchor = document.createElement('a');
+    anchor.href = cleanUrl;
+    anchor.textContent = displayLabel;
+    insertHtmlAtRichCaret(anchor);
+    setActivePopover('none');
+  };
 
-      // Move cursor right after the inserted link
-      const after = document.createRange();
-      after.setStartAfter(anchor);
-      after.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(after);
+  const handleInsertImage = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanUrl = imageUrl.trim();
+    if (!cleanUrl || !isSafeUrl(cleanUrl)) return;
+    const alt = imageAlt.trim() || 'Image';
+
+    if (editorMode === 'raw') {
+      const sel = savedRawSelectionRef.current ?? {
+        start: value.length,
+        end: value.length,
+      };
+      const { nextValue, nextStart, nextEnd } = applyRawMarkdownFormat(
+        value,
+        sel.start,
+        sel.end,
+        'image',
+        { url: cleanUrl, label: alt }
+      );
+      lastEmittedRef.current = nextValue;
+      onChange(nextValue);
+      setActivePopover('none');
+      requestAnimationFrame(() => {
+        if (rawRef.current) {
+          rawRef.current.focus();
+          rawRef.current.setSelectionRange(nextStart, nextEnd);
+        }
+      });
+      return;
     }
 
-    setLinkPopoverOpen(false);
-    syncRichToMarkdown();
+    const p = document.createElement('p');
+    const img = document.createElement('img');
+    img.src = cleanUrl;
+    img.alt = alt;
+    p.appendChild(img);
+    insertHtmlAtRichCaret(p);
+    setActivePopover('none');
   };
+
+  const handleInsertVideo = (e: React.FormEvent) => {
+    e.preventDefault();
+    const resolved = resolveVideoEmbed(videoUrl);
+    if (!resolved) return;
+    const title = videoTitle.trim() || 'Embedded video';
+
+    if (editorMode === 'raw') {
+      const sel = savedRawSelectionRef.current ?? {
+        start: value.length,
+        end: value.length,
+      };
+      const { nextValue, nextStart, nextEnd } = applyRawMarkdownFormat(
+        value,
+        sel.start,
+        sel.end,
+        'video',
+        { url: videoUrl.trim(), label: title }
+      );
+      lastEmittedRef.current = nextValue;
+      onChange(nextValue);
+      setActivePopover('none');
+      requestAnimationFrame(() => {
+        if (rawRef.current) {
+          rawRef.current.focus();
+          rawRef.current.setSelectionRange(nextStart, nextEnd);
+        }
+      });
+      return;
+    }
+
+    const figure = document.createElement('figure');
+    figure.setAttribute('data-video-embed', 'true');
+    figure.setAttribute('data-video-kind', resolved.kind);
+    figure.setAttribute('data-video-src', resolved.embedSrc);
+    figure.setAttribute('data-video-title', title);
+    figure.setAttribute('contenteditable', 'false');
+
+    const labelSpan = document.createElement('span');
+    labelSpan.textContent = `Video: ${title}`;
+    const urlSpan = document.createElement('span');
+    urlSpan.style.color = '#71717A';
+    urlSpan.style.fontFamily = 'monospace';
+    urlSpan.style.fontSize = '11px';
+    urlSpan.textContent = resolved.embedSrc;
+
+    figure.appendChild(labelSpan);
+    figure.appendChild(urlSpan);
+    insertHtmlAtRichCaret(figure);
+    setActivePopover('none');
+  };
+
+  const handleInsertMath = (e: React.FormEvent) => {
+    e.preventDefault();
+    const formula = mathFormula.trim();
+    if (!formula) return;
+
+    const action = mathMode === 'block' ? 'mathBlock' : 'mathInline';
+
+    if (editorMode === 'raw') {
+      const sel = savedRawSelectionRef.current ?? {
+        start: value.length,
+        end: value.length,
+      };
+      const { nextValue, nextStart, nextEnd } = applyRawMarkdownFormat(
+        value,
+        sel.start,
+        sel.end,
+        action,
+        { formula }
+      );
+      lastEmittedRef.current = nextValue;
+      onChange(nextValue);
+      setActivePopover('none');
+      requestAnimationFrame(() => {
+        if (rawRef.current) {
+          rawRef.current.focus();
+          rawRef.current.setSelectionRange(nextStart, nextEnd);
+        }
+      });
+      return;
+    }
+
+    if (mathMode === 'block') {
+      const p = document.createElement('p');
+      p.textContent = `$$${formula}$$`;
+      insertHtmlAtRichCaret(p);
+    } else {
+      const span = document.createTextNode(`$${formula}$`);
+      insertHtmlAtRichCaret(span);
+    }
+    setActivePopover('none');
+  };
+
+  const mathPreviewHtml = useMemo(() => {
+    if (activePopover !== 'math' || !mathFormula.trim()) return '';
+    try {
+      return katex.renderToString(mathFormula.trim(), {
+        displayMode: mathMode === 'block',
+        throwOnError: false,
+        strict: false,
+      });
+    } catch {
+      return '';
+    }
+  }, [activePopover, mathFormula, mathMode]);
+
+  const resolvedVideoPreview = useMemo(() => {
+    if (!videoUrl.trim()) return null;
+    return resolveVideoEmbed(videoUrl);
+  }, [videoUrl]);
 
   const handleRichPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
     const html = e.clipboardData.getData('text/html');
@@ -320,42 +716,98 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
 
   const stats = calculateReadingStats(value);
 
-  const toolbarButtons: Array<{
-    action: FormatAction;
-    label: string;
-    icon: React.ReactNode;
-  }> = [
-    { action: 'bold', label: 'Bold', icon: <Bold className="h-4 w-4" /> },
-    { action: 'italic', label: 'Italic', icon: <Italic className="h-4 w-4" /> },
-    { action: 'h1', label: 'Heading 1', icon: <Heading1 className="h-4 w-4" /> },
-    { action: 'h2', label: 'Heading 2', icon: <Heading2 className="h-4 w-4" /> },
-    { action: 'h3', label: 'Heading 3', icon: <Heading3 className="h-4 w-4" /> },
-    { action: 'ul', label: 'Bullet List', icon: <List className="h-4 w-4" /> },
-    { action: 'ol', label: 'Numbered List', icon: <ListOrdered className="h-4 w-4" /> },
-    { action: 'blockquote', label: 'Blockquote', icon: <Quote className="h-4 w-4" /> },
-    { action: 'link', label: 'Insert Link', icon: <Link2 className="h-4 w-4" /> },
+  const toolbarGroups: Array<
+    Array<{
+      action: FormatAction;
+      label: string;
+      icon: React.ReactNode;
+      popover?: ActivePopover;
+    }>
+  > = [
+    [
+      { action: 'bold', label: 'Bold', icon: <Bold className="h-4 w-4" /> },
+      { action: 'italic', label: 'Italic', icon: <Italic className="h-4 w-4" /> },
+      { action: 'h1', label: 'Heading 1', icon: <Heading1 className="h-4 w-4" /> },
+      { action: 'h2', label: 'Heading 2', icon: <Heading2 className="h-4 w-4" /> },
+      { action: 'h3', label: 'Heading 3', icon: <Heading3 className="h-4 w-4" /> },
+      { action: 'ul', label: 'Bullet List', icon: <List className="h-4 w-4" /> },
+      { action: 'ol', label: 'Numbered List', icon: <ListOrdered className="h-4 w-4" /> },
+      { action: 'blockquote', label: 'Blockquote', icon: <Quote className="h-4 w-4" /> },
+    ],
+    [
+      { action: 'alignLeft', label: 'Align Left', icon: <AlignLeft className="h-4 w-4" /> },
+      { action: 'alignCenter', label: 'Align Center', icon: <AlignCenter className="h-4 w-4" /> },
+      { action: 'alignRight', label: 'Align Right', icon: <AlignRight className="h-4 w-4" /> },
+    ],
+    [
+      { action: 'color', label: 'Text Color', icon: <Palette className="h-4 w-4" />, popover: 'color' },
+    ],
+    [
+      { action: 'hr', label: 'Insert Horizontal Line (---)', icon: <Minus className="h-4 w-4" /> },
+      { action: 'br', label: 'Insert Line Break (<br />)', icon: <CornerDownLeft className="h-4 w-4" /> },
+    ],
+    [
+      { action: 'link', label: 'Insert Link', icon: <Link2 className="h-4 w-4" />, popover: 'link' },
+      { action: 'image', label: 'Insert Image / GIF', icon: <ImageIcon className="h-4 w-4" />, popover: 'image' },
+      { action: 'video', label: 'Insert Video (YouTube / MP4)', icon: <Video className="h-4 w-4" />, popover: 'video' },
+      { action: 'mathInline', label: 'Insert Inline Math ($...$)', icon: <Sigma className="h-4 w-4" />, popover: 'math' },
+      { action: 'mathBlock', label: 'Insert Block Equation ($$...$$)', icon: <SquareFunction className="h-4 w-4" />, popover: 'math' },
+    ],
   ];
 
   return (
     <div className="flex flex-col rounded-xl border border-[#E4E4E7] bg-white">
       {/* Toolbar */}
       <div className="relative flex flex-wrap items-center justify-between gap-2 border-b border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 rounded-t-xl">
-        <div className="flex flex-wrap items-center gap-0.5" role="toolbar" aria-label="Formatting tools">
-          {toolbarButtons.map((btn) => (
-            <button
-              key={btn.action}
-              type="button"
-              title={btn.label}
-              aria-label={btn.label}
-              onMouseDown={(e) => {
-                // Preserve current text selection inside editor
-                e.preventDefault();
-              }}
-              onClick={() => applyFormat(btn.action)}
-              className="flex h-9 w-9 items-center justify-center rounded-lg text-[#52525B] transition-colors hover:bg-[#E4E4E7]/70 hover:text-[#18181B] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#2563EB]"
-            >
-              {btn.icon}
-            </button>
+        <div
+          className="flex flex-wrap items-center gap-1"
+          role="toolbar"
+          aria-label="Formatting tools"
+        >
+          {toolbarGroups.map((group, groupIdx) => (
+            <React.Fragment key={groupIdx}>
+              {groupIdx > 0 && (
+                <span
+                  aria-hidden="true"
+                  className="mx-1 h-5 w-px bg-[#E4E4E7]"
+                />
+              )}
+              <div className="flex items-center gap-0.5">
+                {group.map((btn) => {
+                  const isActive =
+                    btn.popover !== undefined &&
+                    activePopover === btn.popover &&
+                    (btn.popover !== 'math' ||
+                      (btn.action === 'mathInline' && mathMode === 'inline') ||
+                      (btn.action === 'mathBlock' && mathMode === 'block'));
+                  return (
+                    <button
+                      key={btn.action}
+                      type="button"
+                      title={btn.label}
+                      aria-label={btn.label}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                      }}
+                      onClick={() => {
+                        if (btn.action === 'color') {
+                          openPopover('color');
+                        } else {
+                          applyFormat(btn.action);
+                        }
+                      }}
+                      className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#2563EB] ${
+                        isActive
+                          ? 'bg-[#2563EB]/10 text-[#2563EB]'
+                          : 'text-[#52525B] hover:bg-[#E4E4E7]/70 hover:text-[#18181B]'
+                      }`}
+                    >
+                      {btn.icon}
+                    </button>
+                  );
+                })}
+              </div>
+            </React.Fragment>
           ))}
         </div>
 
@@ -387,8 +839,38 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
           </button>
         </div>
 
+        {/* Text Color Swatch Popover */}
+        {activePopover === 'color' && (
+          <div className="absolute top-full left-3 z-20 mt-2 w-[min(300px,calc(100vw-2rem))] rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg">
+            <div className="mb-2.5 flex items-center justify-between">
+              <span className="text-xs font-semibold text-[#18181B]">Text Color</span>
+              <button
+                type="button"
+                onClick={handleClearColor}
+                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-[#52525B] hover:bg-[#F4F4F5] hover:text-[#18181B]"
+              >
+                <Eraser className="h-3 w-3" />
+                Clear Color
+              </button>
+            </div>
+            <div className="grid grid-cols-7 gap-2">
+              {PRESET_TEXT_COLORS.map((swatch) => (
+                <button
+                  key={swatch.hex}
+                  type="button"
+                  title={swatch.name}
+                  aria-label={`Apply ${swatch.name}`}
+                  onClick={() => handleApplyColor(swatch.hex)}
+                  className="h-7 w-7 rounded-lg border border-black/10 transition-transform hover:scale-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2563EB]"
+                  style={{ backgroundColor: swatch.hex }}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Inline Link Popover */}
-        {linkPopoverOpen && (
+        {activePopover === 'link' && (
           <form
             onSubmit={handleInsertLink}
             className="absolute top-full left-3 z-20 mt-2 flex w-[min(360px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
@@ -413,7 +895,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
             <div className="flex items-center justify-end gap-2 pt-0.5">
               <button
                 type="button"
-                onClick={() => setLinkPopoverOpen(false)}
+                onClick={() => setActivePopover('none')}
                 className="rounded-lg px-3 py-1.5 text-xs font-medium text-[#52525B] hover:bg-[#F4F4F5]"
               >
                 Cancel
@@ -423,6 +905,170 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
                 className="rounded-lg bg-[#2563EB] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#1D4ED8]"
               >
                 Apply Link
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* Image / GIF Popover */}
+        {activePopover === 'image' && (
+          <form
+            onSubmit={handleInsertImage}
+            className="absolute top-full left-3 z-20 mt-2 flex w-[min(380px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
+          >
+            <div className="text-xs font-semibold text-[#18181B]">
+              Insert Image or GIF
+            </div>
+            <input
+              type="text"
+              required
+              autoFocus
+              value={imageUrl}
+              onChange={(e) => setImageUrl(e.target.value)}
+              placeholder="https://example.com/media.gif or /images/photo.jpg"
+              className="rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-1.5 font-mono text-xs text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
+            />
+            <input
+              type="text"
+              value={imageAlt}
+              onChange={(e) => setImageAlt(e.target.value)}
+              placeholder="Alt text description (for accessibility)"
+              className="rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-1.5 text-sm text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
+            />
+            <div className="flex items-center justify-end gap-2 pt-0.5">
+              <button
+                type="button"
+                onClick={() => setActivePopover('none')}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium text-[#52525B] hover:bg-[#F4F4F5]"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="rounded-lg bg-[#2563EB] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#1D4ED8]"
+              >
+                Insert Image
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* Video Embed Popover */}
+        {activePopover === 'video' && (
+          <form
+            onSubmit={handleInsertVideo}
+            className="absolute top-full left-3 z-20 mt-2 flex w-[min(400px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
+          >
+            <div className="text-xs font-semibold text-[#18181B]">
+              Insert Video (YouTube, Vimeo, or MP4)
+            </div>
+            <input
+              type="text"
+              required
+              autoFocus
+              value={videoUrl}
+              onChange={(e) => setVideoUrl(e.target.value)}
+              placeholder="https://www.youtube.com/watch?v=... or .../video.mp4"
+              className="rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-1.5 font-mono text-xs text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
+            />
+            <input
+              type="text"
+              value={videoTitle}
+              onChange={(e) => setVideoTitle(e.target.value)}
+              placeholder="Video title / caption (optional)"
+              className="rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-1.5 text-sm text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
+            />
+            {resolvedVideoPreview && (
+              <p className="font-mono text-[11px] text-[#71717A] truncate">
+                {resolvedVideoPreview.kind === 'iframe'
+                  ? `Embed URL: ${resolvedVideoPreview.embedSrc}`
+                  : `Direct video: ${resolvedVideoPreview.embedSrc}`}
+              </p>
+            )}
+            <div className="flex items-center justify-end gap-2 pt-0.5">
+              <button
+                type="button"
+                onClick={() => setActivePopover('none')}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium text-[#52525B] hover:bg-[#F4F4F5]"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={!resolvedVideoPreview}
+                className="rounded-lg bg-[#2563EB] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#1D4ED8] disabled:opacity-50"
+              >
+                Insert Video
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* Math Equation Popover */}
+        {activePopover === 'math' && (
+          <form
+            onSubmit={handleInsertMath}
+            className="absolute top-full left-3 z-20 mt-2 flex w-[min(420px,calc(100vw-2rem))] flex-col gap-2.5 rounded-xl border border-[#E4E4E7] bg-white p-3.5 shadow-lg"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-semibold text-[#18181B]">
+                Insert LaTeX Math Equation
+              </span>
+              <div className="flex items-center gap-1 rounded-lg bg-[#F4F4F5] p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setMathMode('inline')}
+                  className={`rounded-md px-2 py-1 text-[11px] font-medium ${
+                    mathMode === 'inline'
+                      ? 'bg-white text-[#18181B] shadow-xs'
+                      : 'text-[#71717A]'
+                  }`}
+                >
+                  Inline ($...$)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMathMode('block')}
+                  className={`rounded-md px-2 py-1 text-[11px] font-medium ${
+                    mathMode === 'block'
+                      ? 'bg-white text-[#18181B] shadow-xs'
+                      : 'text-[#71717A]'
+                  }`}
+                >
+                  Block ($$...$$)
+                </button>
+              </div>
+            </div>
+
+            <textarea
+              rows={mathMode === 'block' ? 3 : 2}
+              required
+              autoFocus
+              value={mathFormula}
+              onChange={(e) => setMathFormula(e.target.value)}
+              placeholder="e.g. \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}"
+              className="w-full resize-none rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 font-mono text-xs text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
+            />
+
+            {mathPreviewHtml && (
+              <div className="overflow-x-auto rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-center text-sm text-[#18181B]">
+                <span dangerouslySetInnerHTML={{ __html: mathPreviewHtml }} />
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2 pt-0.5">
+              <button
+                type="button"
+                onClick={() => setActivePopover('none')}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium text-[#52525B] hover:bg-[#F4F4F5]"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="rounded-lg bg-[#2563EB] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#1D4ED8]"
+              >
+                Insert Equation
               </button>
             </div>
           </form>
@@ -439,7 +1085,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
             onInput={syncRichToMarkdown}
             onBlur={syncRichToMarkdown}
             onPaste={handleRichPaste}
-            data-placeholder="Write your Project Fibre story here. Use the toolbar above for headings, lists, links, and blockquotes — everything converts cleanly to Markdown..."
+            data-placeholder="Write your Project Fibre story here. Use the toolbar above for headings, alignment, colors, media, and math — everything converts cleanly to Markdown..."
             className="rich-editor-surface min-h-[380px] text-[15.5px] leading-[1.75] text-[#18181B] focus:outline-none"
           />
         ) : (

@@ -131,6 +131,7 @@ export default function App() {
       'date',
       'category',
       'tags',
+      'excerpt',
       'summary',
       'content',
       'createdAt',
@@ -150,9 +151,9 @@ export default function App() {
       date: post.date || new Date().toISOString().slice(0, 10),
       categoryTags:
         post.tags.length > 0 ? post.tags.join(', ') : post.category || '',
-      summary: post.summary,
+      summary: post.excerpt || post.summary || '',
       content: post.content,
-      createdAt: post.createdAt,
+      createdAt: post.createdAt ?? null,
       extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
     });
     setSlugTouched(true);
@@ -269,7 +270,7 @@ export default function App() {
         ...prev,
         editingId: savedPost.id,
         slug: savedPost.slug,
-        createdAt: savedPost.createdAt,
+        createdAt: savedPost.createdAt ?? null,
       }));
       setSlugTouched(true);
 
@@ -515,6 +516,7 @@ export default function App() {
         {/* Progress, Confirmation, and 401/403 Auth Alert */}
         <StatusBanner
           status={status}
+          repoName={settings.repo}
           onDismiss={() => setStatus({ type: 'idle', title: '', message: '' })}
           onOpenSettings={() => setSettingsOpen(true)}
         />

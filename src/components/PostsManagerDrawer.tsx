@@ -47,9 +47,9 @@ export const PostsManagerDrawer: React.FC<PostsManagerDrawerProps> = ({
     return posts.filter((post) => {
       const haystack = [
         post.title,
-        post.category,
+        post.category ?? '',
         post.tags.join(' '),
-        post.summary,
+        post.excerpt || post.summary || '',
         post.slug,
       ]
         .join(' ')
@@ -176,9 +176,9 @@ export const PostsManagerDrawer: React.FC<PostsManagerDrawerProps> = ({
                         <h3 className="mt-1 font-serif text-base font-semibold text-[#18181B]">
                           {post.title}
                         </h3>
-                        {post.summary && (
+                        {(post.excerpt || post.summary) && (
                           <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-[#52525B]">
-                            {post.summary}
+                            {post.excerpt || post.summary}
                           </p>
                         )}
                       </div>

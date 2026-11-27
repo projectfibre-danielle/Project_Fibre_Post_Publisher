@@ -11,12 +11,14 @@ import { PublishStatus } from '../types/blog';
 
 interface StatusBannerProps {
   status: PublishStatus;
+  repoName: string;
   onDismiss: () => void;
   onOpenSettings: () => void;
 }
 
 export const StatusBanner: React.FC<StatusBannerProps> = ({
   status,
+  repoName,
   onDismiss,
   onOpenSettings,
 }) => {
@@ -98,7 +100,7 @@ export const StatusBanner: React.FC<StatusBannerProps> = ({
                 {status.title} {status.httpStatus ? `(HTTP ${status.httpStatus})` : ''}
               </h3>
               <p className="mt-1 text-xs leading-relaxed text-[#7F1D1D]">
-                Your GitHub Personal Access Token appears to be expired, revoked, or missing the required repository scope (<span className="font-semibold">Contents: Read and write</span>). Open Settings to clear the old token, revoke/generate a replacement Fine-Grained PAT on GitHub, and paste the new token into Project Fibre.
+                Your Personal Access Token may be expired, revoked, or missing <span className="font-semibold">Contents: Read and write</span> permissions on <span className="font-mono font-semibold">{repoName || 'Project_fibre'}</span>. Open Settings to revoke/clear the old token and paste a fresh token from GitHub.
               </p>
               {status.message && (
                 <p className="mt-1.5 font-mono text-[11px] text-[#991B1B]/90">

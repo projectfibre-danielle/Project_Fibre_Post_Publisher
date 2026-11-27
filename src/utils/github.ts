@@ -93,11 +93,11 @@ function normalizePostRecord(raw: unknown, index: number): BlogPost {
     typeof item.category === 'string' && item.category.trim()
       ? item.category.trim()
       : tags[0] ?? 'General';
-  const summary =
-    typeof item.summary === 'string'
-      ? item.summary
-      : typeof item.excerpt === 'string'
-        ? item.excerpt
+  const excerpt =
+    typeof item.excerpt === 'string'
+      ? item.excerpt
+      : typeof item.summary === 'string'
+        ? item.summary
         : '';
   const content =
     typeof item.content === 'string'
@@ -131,7 +131,7 @@ function normalizePostRecord(raw: unknown, index: number): BlogPost {
     date,
     category,
     tags,
-    summary,
+    excerpt,
     content,
     createdAt,
     updatedAt,
@@ -326,7 +326,7 @@ export async function publishPostToGitHub(
     date: draft.date || new Date().toISOString().slice(0, 10),
     category,
     tags,
-    summary: draft.summary.trim(),
+    excerpt: draft.summary.trim(),
     content: draft.content.trim(),
     createdAt:
       (wasUpdate ? existingPosts[existingIndex].createdAt : draft.createdAt) ||

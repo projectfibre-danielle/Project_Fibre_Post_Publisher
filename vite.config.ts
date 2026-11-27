@@ -4,8 +4,14 @@ import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
 
-export default defineConfig(() => {
+export default defineConfig(({command}) => {
+  // For GitHub Pages (https://<username>.github.io/<second-repo-name>/),
+  // defaults to './' on build so assets resolve cleanly without a blank screen,
+  // or set VITE_BASE_PATH='/<second-repo-name>/' (e.g. '/project-fibre-publisher/').
+  const base = command === 'build' ? process.env.VITE_BASE_PATH || './' : '/';
+
   return {
+    base,
     plugins: [
       react(),
       tailwindcss(),

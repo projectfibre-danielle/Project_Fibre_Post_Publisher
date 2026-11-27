@@ -352,7 +352,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 />
               </div>
 
-              {expirationSummary && (
+              {expirationSummary ? (
                 <p
                   className={`sm:col-span-2 text-xs font-medium tabular-nums ${
                     expirationSummary.tone === 'expired'
@@ -363,6 +363,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   }`}
                 >
                   {expirationSummary.label}
+                </p>
+              ) : (
+                <p className="sm:col-span-2 text-xs text-[#71717A]">
+                  GitHub Fine-Grained PATs expire on the schedule you choose — record the expiration date here so you know when to renew it.
                 </p>
               )}
             </div>

@@ -13,12 +13,13 @@ export interface BlogPost {
   slug: string;
   title: string;
   date: string;
-  category: string;
+  excerpt: string;
   tags: string[];
-  summary: string;
   content: string;
-  createdAt: string;
-  updatedAt: string;
+  category?: string;
+  summary?: string;
+  createdAt?: string;
+  updatedAt?: string;
   [key: string]: unknown;
 }
 

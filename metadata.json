@@ -1,0 +1,6 @@
+{
+  "name": "Project Fibre — Blog Editor & Publisher",
+  "description": "A distraction-free Markdown blog post editor and GitHub publisher for Project Fibre.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

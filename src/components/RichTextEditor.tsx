@@ -2,12 +2,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import katex from 'katex';
 import {
   AlertCircle,
+  AlertTriangle,
   AlignCenter,
   AlignLeft,
   AlignRight,
   Bold,
   Code2,
-  CornerDownLeft,
   Eraser,
   FileText,
   Heading1,
@@ -21,6 +21,7 @@ import {
   List,
   ListOrdered,
   Minus,
+  OctagonAlert,
   Palette,
   Quote,
   Sigma,
@@ -137,12 +138,17 @@ function clearColorFromRichSelection(root: HTMLElement): void {
   if (!sel || sel.rangeCount === 0) return;
 
   const range = sel.getRangeAt(0);
-  const candidates = Array.from(root.querySelectorAll('span[style], font'));
+  const candidates = Array.from(
+    root.querySelectorAll(
+      'span[style], font, strong[style], b[style], em[style], i[style], u[style], p[style], h1[style], h2[style], h3[style], li[style]'
+    )
+  );
   let changed = false;
 
   for (const el of candidates) {
     if (range.intersectsNode(el)) {
-      if (el.tagName.toLowerCase() === 'font') {
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'font') {
         const parent = el.parentNode;
         if (parent) {
           while (el.firstChild) {
@@ -153,13 +159,17 @@ function clearColorFromRichSelection(root: HTMLElement): void {
         }
       } else if (el instanceof HTMLElement && el.style.color) {
         el.style.removeProperty('color');
-        if (!el.getAttribute('style')?.trim()) {
-          const parent = el.parentNode;
-          if (parent) {
-            while (el.firstChild) {
-              parent.insertBefore(el.firstChild, el);
+        const remainingStyle = el.getAttribute('style')?.trim();
+        if (!remainingStyle) {
+          el.removeAttribute('style');
+          if (tag === 'span') {
+            const parent = el.parentNode;
+            if (parent) {
+              while (el.firstChild) {
+                parent.insertBefore(el.firstChild, el);
+              }
+              parent.removeChild(el);
             }
-            parent.removeChild(el);
           }
         }
         changed = true;
@@ -437,30 +447,34 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         insertHtmlAtRichCaret(frag);
         return;
       }
-      case 'br': {
-        const br = document.createElement('br');
-        br.setAttribute('data-explicit-br', 'true');
-        insertHtmlAtRichCaret(br);
-        return;
-      }
       case 'clearColor':
         clearColorFromRichSelection(richRef.current);
         break;
       case 'calloutNote':
       case 'calloutTip':
-      case 'calloutImportant': {
+      case 'calloutImportant':
+      case 'calloutWarning':
+      case 'calloutCaution': {
         const kind =
           action === 'calloutNote'
             ? 'note'
             : action === 'calloutTip'
               ? 'tip'
-              : 'important';
+              : action === 'calloutImportant'
+                ? 'important'
+                : action === 'calloutWarning'
+                  ? 'warning'
+                  : 'caution';
         const placeholder =
           kind === 'note'
             ? 'Useful information readers should know.'
             : kind === 'tip'
               ? 'Helpful advice for doing things better or more easily.'
-              : 'Key information readers need to know.';
+              : kind === 'important'
+                ? 'Key information readers need to know.'
+                : kind === 'warning'
+                  ? 'Urgent info that needs immediate attention to avoid problems.'
+                  : 'Advises about risks or negative outcomes of certain actions.';
 
         const sel = window.getSelection();
         const anchorNode = sel?.anchorNode ?? null;
@@ -899,6 +913,18 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
         shortLabel: 'Important',
         icon: <AlertCircle className="h-3.5 w-3.5 text-[#7C3AED]" />,
       },
+      {
+        action: 'calloutWarning',
+        label: 'Insert Warning Callout (> [!WARNING])',
+        shortLabel: 'Warning',
+        icon: <AlertTriangle className="h-3.5 w-3.5 text-[#D97706]" />,
+      },
+      {
+        action: 'calloutCaution',
+        label: 'Insert Caution Callout (> [!CAUTION])',
+        shortLabel: 'Caution',
+        icon: <OctagonAlert className="h-3.5 w-3.5 text-[#DC2626]" />,
+      },
     ],
     [
       { action: 'alignLeft', label: 'Align Left', icon: <AlignLeft className="h-4 w-4" /> },
@@ -923,7 +949,6 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
     ],
     [
       { action: 'hr', label: 'Insert Horizontal Line (---)', icon: <Minus className="h-4 w-4" /> },
-      { action: 'br', label: 'Insert Line Break (<br />)', icon: <CornerDownLeft className="h-4 w-4" /> },
     ],
     [
       { action: 'link', label: 'Insert Link', icon: <Link2 className="h-4 w-4" />, popover: 'link' },

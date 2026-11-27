@@ -15,17 +15,18 @@ export type FormatAction =
   | 'color'
   | 'clearColor'
   | 'hr'
-  | 'br'
   | 'image'
   | 'video'
   | 'mathInline'
   | 'mathBlock'
   | 'calloutNote'
   | 'calloutTip'
-  | 'calloutImportant';
+  | 'calloutImportant'
+  | 'calloutWarning'
+  | 'calloutCaution';
 
 export type TextAlign = 'left' | 'center' | 'right';
-export type CalloutKind = 'note' | 'tip' | 'important';
+export type CalloutKind = 'note' | 'tip' | 'important' | 'warning' | 'caution';
 
 export const PRESET_TEXT_COLORS: Array<{ name: string; hex: string }> = [
   { name: 'Deep Plum', hex: '#2d1f3d' },
@@ -250,7 +251,7 @@ export function parseInlineMarkdown(text: string, depth = 0): InlineToken[] {
   // 12. _italic_ (primary italic syntax, safe against snake_case identifiers)
   // 13. *italic* (fallback for legacy posts)
   const pattern =
-    /(<br\s*\/?>|<span\s+style=["']([^"']+)["']\s*>([\s\S]*?)<\/span>|<u>([\s\S]*?)<\/u>|<(?:strong|b)>([\s\S]*?)<\/(?:strong|b)>|<(?:em|i)>([\s\S]*?)<\/(?:em|i)>|!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(([^)\s]+)\)|`([^`]+)`|\$(?!\$)([^\n$]+?)\$|\*\*\*([^\n*]+?)\*\*\*|___([^\n_]+?)___|(?:\*\*([^\n]+?)\*\*)|(?:(?<![\w\\])_([^\n_]+?)_(?!\w))|(?:(?<!\*)\*(?!\*)([^\n*]+?)(?<!\*)\*(?!\*)))/gi;
+    /(<br\s*\/?>|<span\s+style=["']([^"']+)["']\s*>|<u>([\s\S]*?)<\/u>|<(?:strong|b)>([\s\S]*?)<\/(?:strong|b)>|<(?:em|i)>([\s\S]*?)<\/(?:em|i)>|!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(([^)\s]+)\)|`([^`]+)`|\$(?!\$)([^\n$]+?)\$|\*\*\*([^\n*]+?)\*\*\*|___([^\n_]+?)___|(?:\*\*([^\n]+?)\*\*)|(?:(?<![\w\\])_([^\n_]+?)_(?!\w))|(?:(?<!\*)\*(?!\*)([^\n*]+?)(?<!\*)\*(?!\*)))/gi;
 
   let lastIndex = 0;
   let match: RegExpExecArray | null;
@@ -264,9 +265,35 @@ export function parseInlineMarkdown(text: string, depth = 0): InlineToken[] {
 
     if (/^<br\s*\/?>$/i.test(full)) {
       tokens.push({ type: 'br', text: '' });
-    } else if (match[2] !== undefined && match[3] !== undefined) {
+    } else if (match[2] !== undefined) {
       const styleStr = match[2];
-      const inner = match[3];
+      const contentStart = pattern.lastIndex;
+      const spanTagRe = /<span\b[^>]*>|<\/span>/gi;
+      spanTagRe.lastIndex = contentStart;
+      let spanDepth = 1;
+      let closeStart = -1;
+      let closeEnd = -1;
+      let tagMatch: RegExpExecArray | null;
+
+      while ((tagMatch = spanTagRe.exec(text)) !== null) {
+        if (tagMatch[0].toLowerCase().startsWith('</span')) {
+          spanDepth -= 1;
+          if (spanDepth === 0) {
+            closeStart = tagMatch.index;
+            closeEnd = spanTagRe.lastIndex;
+            break;
+          }
+        } else {
+          spanDepth += 1;
+        }
+      }
+
+      const inner =
+        closeStart !== -1
+          ? text.slice(contentStart, closeStart)
+          : text.slice(contentStart);
+      pattern.lastIndex = closeEnd !== -1 ? closeEnd : text.length;
+
       const colorMatch = /color\s*:\s*([^;]+)/i.exec(styleStr);
       const rawColor = colorMatch ? normalizeColorToHex(colorMatch[1]) : null;
       const hasUnderline = /text-decoration(?:-line)?\s*:\s*underline/i.test(styleStr);
@@ -301,46 +328,46 @@ export function parseInlineMarkdown(text: string, depth = 0): InlineToken[] {
       } else {
         tokens.push(...innerTokens);
       }
-    } else if (match[4] !== undefined) {
+    } else if (match[3] !== undefined) {
       tokens.push({
         type: 'underline',
+        text: match[3],
+        children: parseInlineMarkdown(match[3], depth + 1),
+      });
+    } else if (match[4] !== undefined) {
+      tokens.push({
+        type: 'bold',
         text: match[4],
         children: parseInlineMarkdown(match[4], depth + 1),
       });
     } else if (match[5] !== undefined) {
       tokens.push({
-        type: 'bold',
+        type: 'italic',
         text: match[5],
         children: parseInlineMarkdown(match[5], depth + 1),
       });
-    } else if (match[6] !== undefined) {
-      tokens.push({
-        type: 'italic',
-        text: match[6],
-        children: parseInlineMarkdown(match[6], depth + 1),
-      });
-    } else if (match[7] !== undefined && match[8] !== undefined) {
-      const src = match[8].trim();
+    } else if (match[6] !== undefined && match[7] !== undefined) {
+      const src = match[7].trim();
       tokens.push({
         type: 'image',
-        text: match[7],
-        alt: match[7],
+        text: match[6],
+        alt: match[6],
         src: isSafeUrl(src) ? src : '',
       });
-    } else if (match[9] !== undefined && match[10] !== undefined) {
-      const href = match[10].trim();
+    } else if (match[8] !== undefined && match[9] !== undefined) {
+      const href = match[9].trim();
       tokens.push({
         type: 'link',
-        text: match[9],
+        text: match[8],
         href: isSafeUrl(href) ? href : '#',
-        children: parseInlineMarkdown(match[9], depth + 1),
+        children: parseInlineMarkdown(match[8], depth + 1),
       });
+    } else if (match[10] !== undefined) {
+      tokens.push({ type: 'code', text: match[10] });
     } else if (match[11] !== undefined) {
-      tokens.push({ type: 'code', text: match[11] });
-    } else if (match[12] !== undefined) {
-      tokens.push({ type: 'math_inline', text: match[12].trim() });
-    } else if (match[13] !== undefined || match[14] !== undefined) {
-      const inner = match[13] ?? match[14];
+      tokens.push({ type: 'math_inline', text: match[11].trim() });
+    } else if (match[12] !== undefined || match[13] !== undefined) {
+      const inner = match[12] ?? match[13];
       tokens.push({
         type: 'bold',
         text: inner,
@@ -352,14 +379,14 @@ export function parseInlineMarkdown(text: string, depth = 0): InlineToken[] {
           },
         ],
       });
-    } else if (match[15] !== undefined) {
+    } else if (match[14] !== undefined) {
       tokens.push({
         type: 'bold',
-        text: match[15],
-        children: parseInlineMarkdown(match[15], depth + 1),
+        text: match[14],
+        children: parseInlineMarkdown(match[14], depth + 1),
       });
-    } else if (match[16] !== undefined || match[17] !== undefined) {
-      const inner = match[16] ?? match[17];
+    } else if (match[15] !== undefined || match[16] !== undefined) {
+      const inner = match[15] ?? match[16];
       tokens.push({
         type: 'italic',
         text: inner,
@@ -606,7 +633,7 @@ export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
       continue;
     }
 
-    // Blockquote & GFM Callouts ([!NOTE], [!TIP], [!IMPORTANT])
+    // Blockquote & GFM Callouts ([!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION])
     if (trimmed.startsWith('>')) {
       const rawQuoteLines: string[] = [];
       while (i < lines.length && lines[i].trim().startsWith('>')) {
@@ -615,7 +642,8 @@ export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
       }
 
       const firstLine = rawQuoteLines[0]?.trim() ?? '';
-      const calloutMatch = /^\[!(NOTE|TIP|IMPORTANT)\]\s*(.*)$/i.exec(firstLine);
+      const calloutMatch =
+        /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$/i.exec(firstLine);
       if (calloutMatch) {
         const kind = calloutMatch[1].toLowerCase() as CalloutKind;
         const remainder = calloutMatch[2]?.trim() ?? '';
@@ -808,27 +836,54 @@ function serializeInlineNode(node: Node, isLastChild = false): string {
 
   switch (tag) {
     case 'strong':
-    case 'b': {
-      const trimmed = inner.trim();
-      if (!trimmed) return '';
-      const leading = inner.startsWith(' ') ? ' ' : '';
-      const trailing = inner.endsWith(' ') ? ' ' : '';
-      return `${leading}**${trimmed}**${trailing}`;
-    }
+    case 'b':
     case 'em':
-    case 'i': {
+    case 'i':
+    case 'u':
+    case 'font':
+    case 'span': {
+      const isSemanticTag = tag !== 'span' && tag !== 'font';
       const trimmed = inner.trim();
-      if (!trimmed) return '';
+      if (!trimmed) return isSemanticTag ? '' : inner;
+
+      const isUnderline =
+        tag === 'u' ||
+        /underline/i.test(
+          el.style?.textDecoration || el.style?.textDecorationLine || ''
+        );
+      const isItalic =
+        tag === 'em' || tag === 'i' || el.style?.fontStyle === 'italic';
+      const isBold =
+        tag === 'strong' ||
+        tag === 'b' ||
+        el.style?.fontWeight === 'bold' ||
+        Number(el.style?.fontWeight) >= 600;
+      const rawColor = el.style?.color || el.getAttribute('color') || '';
+      const hex = rawColor ? normalizeColorToHex(rawColor) : null;
+
+      if (!isBold && !isItalic && !isUnderline && !hex) {
+        return inner;
+      }
+
       const leading = inner.startsWith(' ') ? ' ' : '';
       const trailing = inner.endsWith(' ') ? ' ' : '';
-      return `${leading}_${trimmed}_${trailing}`;
-    }
-    case 'u': {
-      const trimmed = inner.trim();
-      if (!trimmed) return '';
-      const leading = inner.startsWith(' ') ? ' ' : '';
-      const trailing = inner.endsWith(' ') ? ' ' : '';
-      return `${leading}<span style="text-decoration: underline;">${trimmed}</span>${trailing}`;
+      let output = trimmed;
+
+      if (isItalic) {
+        output = `_${output}_`;
+      }
+      if (isBold) {
+        output = `**${output}**`;
+      }
+      if (hex && isUnderline) {
+        output = `<span style="color: ${hex}; text-decoration: underline;">${output}</span>`;
+      } else if (isUnderline) {
+        output = `<span style="text-decoration: underline;">${output}</span>`;
+      } else if (hex) {
+        output = `<span style="color: ${hex}">${output}</span>`;
+      }
+
+      return `${leading}${output}${trailing}`;
     }
     case 'code': {
       const trimmed = inner.trim();
@@ -839,34 +894,6 @@ function serializeInlineNode(node: Node, isLastChild = false): string {
       const label = inner.trim() || href;
       if (!label) return '';
       return href && isSafeUrl(href) ? `[${label}](${href})` : label;
-    }
-    case 'font':
-    case 'span': {
-      if (!inner.trim()) return inner;
-      let output = inner;
-      const isUnderline = /underline/i.test(
-        el.style?.textDecoration || el.style?.textDecorationLine || ''
-      );
-      const isItalic = el.style?.fontStyle === 'italic';
-      const isBold =
-        el.style?.fontWeight === 'bold' ||
-        Number(el.style?.fontWeight) >= 600;
-      const rawColor = el.style?.color || el.getAttribute('color') || '';
-      const hex = rawColor ? normalizeColorToHex(rawColor) : null;
-
-      if (isItalic) {
-        output = `_${output.trim()}_`;
-      }
-      if (isBold) {
-        output = `**${output.trim()}**`;
-      }
-      if (isUnderline) {
-        output = `<span style="text-decoration: underline;">${output}</span>`;
-      }
-      if (hex) {
-        output = `<span style="color: ${hex}">${output}</span>`;
-      }
-      return output;
     }
     default:
       return inner;
@@ -918,14 +945,19 @@ function serializeBlockNode(node: Node): string {
   }
 
   const align = getElementAlign(el);
+  const blockHex = el.style?.color ? normalizeColorToHex(el.style.color) : null;
+  const applyBlockColor = (text: string): string =>
+    text && blockHex ? `<span style="color: ${blockHex}">${text}</span>` : text;
 
   if (tag === 'h1' || tag === 'h2' || tag === 'h3') {
     const level = Number(tag[1]);
     const children = Array.from(el.childNodes);
-    const text = children
-      .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
-      .join('')
-      .trim();
+    const text = applyBlockColor(
+      children
+        .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
+        .join('')
+        .trim()
+    );
     const md = text ? `${'#'.repeat(level)} ${text}` : '';
     return wrapAlignedMarkdown(align, md);
   }
@@ -933,7 +965,11 @@ function serializeBlockNode(node: Node): string {
   if (tag === 'blockquote') {
     const calloutAttr = el.getAttribute('data-callout')?.toLowerCase();
     const calloutTag =
-      calloutAttr === 'note' || calloutAttr === 'tip' || calloutAttr === 'important'
+      calloutAttr === 'note' ||
+      calloutAttr === 'tip' ||
+      calloutAttr === 'important' ||
+      calloutAttr === 'warning' ||
+      calloutAttr === 'caution'
         ? calloutAttr.toUpperCase()
         : null;
 
@@ -964,11 +1000,15 @@ function serializeBlockNode(node: Node): string {
     const items = Array.from(el.children)
       .filter((child) => child.tagName.toLowerCase() === 'li')
       .map((li) => {
+        const liEl = li as HTMLElement;
+        const liHex = liEl.style?.color ? normalizeColorToHex(liEl.style.color) : null;
         const children = Array.from(li.childNodes);
-        const text = children
+        const rawText = children
           .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
           .join('')
           .trim();
+        const text =
+          rawText && liHex ? `<span style="color: ${liHex}">${rawText}</span>` : rawText;
         return text ? `- ${text}` : '';
       })
       .filter(Boolean);
@@ -979,11 +1019,15 @@ function serializeBlockNode(node: Node): string {
     const items = Array.from(el.children)
       .filter((child) => child.tagName.toLowerCase() === 'li')
       .map((li, index) => {
+        const liEl = li as HTMLElement;
+        const liHex = liEl.style?.color ? normalizeColorToHex(liEl.style.color) : null;
         const children = Array.from(li.childNodes);
-        const text = children
+        const rawText = children
           .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
           .join('')
           .trim();
+        const text =
+          rawText && liHex ? `<span style="color: ${liHex}">${rawText}</span>` : rawText;
         return text ? `${index + 1}. ${text}` : '';
       })
       .filter(Boolean);
@@ -1019,10 +1063,12 @@ function serializeBlockNode(node: Node): string {
       return wrapAlignedMarkdown(align, inner);
     }
     const children = Array.from(el.childNodes);
-    const text = children
-      .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
-      .join('')
-      .trim();
+    const text = applyBlockColor(
+      children
+        .map((c, idx) => serializeInlineNode(c, idx === children.length - 1))
+        .join('')
+        .trim()
+    );
     return wrapAlignedMarkdown(align, text);
   }
 
@@ -1237,17 +1283,6 @@ export function applyRawMarkdownFormat(
     };
   }
 
-  if (action === 'br') {
-    const inserted = '<br />';
-    const nextValue =
-      value.slice(0, selectionStart) + inserted + value.slice(selectionEnd);
-    return {
-      nextValue,
-      nextStart: selectionStart + inserted.length,
-      nextEnd: selectionStart + inserted.length,
-    };
-  }
-
   if (action === 'mathInline') {
     const inner = (options?.formula ?? selected) || 'E = mc^2';
     const inserted = `$${inner}$`;
@@ -1336,25 +1371,35 @@ export function applyRawMarkdownFormat(
   } else if (
     action === 'calloutNote' ||
     action === 'calloutTip' ||
-    action === 'calloutImportant'
+    action === 'calloutImportant' ||
+    action === 'calloutWarning' ||
+    action === 'calloutCaution'
   ) {
     const tag =
       action === 'calloutNote'
         ? 'NOTE'
         : action === 'calloutTip'
           ? 'TIP'
-          : 'IMPORTANT';
+          : action === 'calloutImportant'
+            ? 'IMPORTANT'
+            : action === 'calloutWarning'
+              ? 'WARNING'
+              : 'CAUTION';
     const placeholder =
       action === 'calloutNote'
         ? 'Useful information readers should know.'
         : action === 'calloutTip'
           ? 'Helpful advice for doing things better or more easily.'
-          : 'Key information readers need to know.';
+          : action === 'calloutImportant'
+            ? 'Key information readers need to know.'
+            : action === 'calloutWarning'
+              ? 'Urgent info that needs immediate attention to avoid problems.'
+              : 'Advises about risks or negative outcomes of certain actions.';
     const cleaned = lines
       .map((line) =>
         line
           .replace(/^>\s*/, '')
-          .replace(/^\[!(NOTE|TIP|IMPORTANT)\]\s*/i, '')
+          .replace(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*/i, '')
           .trim()
       )
       .filter(Boolean);

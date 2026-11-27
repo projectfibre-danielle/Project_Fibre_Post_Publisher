@@ -1,6 +1,13 @@
 import React, { useState } from 'react';
 import katex from 'katex';
-import { AlertCircle, ImageOff, Info, Lightbulb } from 'lucide-react';
+import {
+  AlertCircle,
+  AlertTriangle,
+  ImageOff,
+  Info,
+  Lightbulb,
+  OctagonAlert,
+} from 'lucide-react';
 import {
   calculateReadingStats,
   InlineToken,
@@ -79,20 +86,34 @@ function renderMathHtml(formula: string, displayMode: boolean): string {
   }
 }
 
-function renderInlineTokens(tokens: InlineToken[]): React.ReactNode {
+function renderInlineTokens(
+  tokens: InlineToken[],
+  inheritColor = false
+): React.ReactNode {
   return tokens.map((token, idx) => {
-    const inner = token.children ? renderInlineTokens(token.children) : token.text;
+    const childInheritColor = inheritColor || token.type === 'color';
+    const inner = token.children
+      ? renderInlineTokens(token.children, childInheritColor)
+      : token.text;
 
     switch (token.type) {
       case 'bold':
         return (
-          <strong key={idx} className="font-semibold text-[#18181B]">
+          <strong
+            key={idx}
+            className={
+              inheritColor ? 'font-semibold' : 'font-semibold text-[#18181B]'
+            }
+          >
             {inner}
           </strong>
         );
       case 'italic':
         return (
-          <em key={idx} className="italic text-[#27272A]">
+          <em
+            key={idx}
+            className={inheritColor ? 'italic' : 'italic text-[#27272A]'}
+          >
             {inner}
           </em>
         );
@@ -245,12 +266,26 @@ function renderBlock(
                 heading: 'text-[#047857]',
                 icon: <Lightbulb className="h-4 w-4 shrink-0 text-[#059669]" />,
               }
-            : {
-                label: 'Important',
-                wrapper: 'border-[#DDD6FE] bg-[#F5F3FF] text-[#3B0764]',
-                heading: 'text-[#6D28D9]',
-                icon: <AlertCircle className="h-4 w-4 shrink-0 text-[#7C3AED]" />,
-              };
+            : block.kind === 'important'
+              ? {
+                  label: 'Important',
+                  wrapper: 'border-[#DDD6FE] bg-[#F5F3FF] text-[#3B0764]',
+                  heading: 'text-[#6D28D9]',
+                  icon: <AlertCircle className="h-4 w-4 shrink-0 text-[#7C3AED]" />,
+                }
+              : block.kind === 'warning'
+                ? {
+                    label: 'Warning',
+                    wrapper: 'border-[#FDE68A] bg-[#FFFBEB] text-[#78350F]',
+                    heading: 'text-[#B45309]',
+                    icon: <AlertTriangle className="h-4 w-4 shrink-0 text-[#D97706]" />,
+                  }
+                : {
+                    label: 'Caution',
+                    wrapper: 'border-[#FECACA] bg-[#FEF2F2] text-[#7F1D1D]',
+                    heading: 'text-[#B91C1C]',
+                    icon: <OctagonAlert className="h-4 w-4 shrink-0 text-[#DC2626]" />,
+                  };
       return (
         <aside
           key={index}
@@ -263,7 +298,7 @@ function renderBlock(
           </div>
           {block.lines.map((line, lineIdx) => (
             <p key={lineIdx} className={lineIdx > 0 ? 'mt-2' : ''}>
-              {renderInlineTokens(line)}
+              {renderInlineTokens(line, true)}
             </p>
           ))}
         </aside>

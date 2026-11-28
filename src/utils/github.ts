@@ -1,5 +1,11 @@
-import { BlogPost, DraftPost, GitHubSettings } from '../types/blog';
-import { parseTagsInput, slugify } from './storage';
+import { BlogPost, DraftPost, GitHubSettings, SavedDraft } from '../types/blog';
+import {
+  getTodayDateString,
+  mergeSavedDraftLists,
+  parseTagsInput,
+  persistSavedDrafts,
+  slugify,
+} from './storage';
 
 export class GitHubApiError extends Error {
   public readonly status: number;
@@ -402,3 +408,413 @@ export async function testGitHubConnection(
     throw err;
   }
 }
+
+function getDraftsConfig(settings: GitHubSettings): {
+  draftsBranch: string;
+  draftsPath: string;
+} {
+  return {
+    draftsBranch: settings.draftsBranch?.trim() || 'drafts',
+    draftsPath: settings.draftsPath?.trim() || 'src/data/drafts.json',
+  };
+}
+
+function normalizeDraftRecord(raw: unknown): SavedDraft | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const item = raw as Record<string, unknown>;
+  const draftId = typeof item.draftId === 'string' && item.draftId ? item.draftId : '';
+  if (!draftId) return null;
+  const savedAt =
+    typeof item.savedAt === 'string' && item.savedAt
+      ? item.savedAt
+      : new Date().toISOString();
+
+  return {
+    draftId,
+    activeDraftId: draftId,
+    editingId: typeof item.editingId === 'string' ? item.editingId : null,
+    title: typeof item.title === 'string' ? item.title : '',
+    slug: typeof item.slug === 'string' ? item.slug : '',
+    date:
+      typeof item.date === 'string' && item.date
+        ? item.date
+        : getTodayDateString(),
+    categoryTags: typeof item.categoryTags === 'string' ? item.categoryTags : '',
+    summary: typeof item.summary === 'string' ? item.summary : '',
+    content: typeof item.content === 'string' ? item.content : '',
+    createdAt: typeof item.createdAt === 'string' ? item.createdAt : null,
+    savedAt,
+    publishedAt: typeof item.publishedAt === 'string' ? item.publishedAt : null,
+    syncedAt: typeof item.syncedAt === 'string' && item.syncedAt ? item.syncedAt : savedAt,
+    extraFields:
+      item.extraFields && typeof item.extraFields === 'object'
+        ? (item.extraFields as Record<string, unknown>)
+        : undefined,
+  };
+}
+
+async function getBranchHeadSha(
+  settings: GitHubSettings,
+  branchName: string
+): Promise<string | null> {
+  const owner = encodeURIComponent(settings.owner.trim());
+  const repo = encodeURIComponent(settings.repo.trim());
+  const refPath = encodeRepoPath(branchName);
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${refPath}`,
+    {
+      method: 'GET',
+      headers: buildHeaders(settings.token),
+      cache: 'no-store',
+    }
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    throw await parseGitHubError(
+      res,
+      `Could not check branch "${branchName}" on GitHub.`
+    );
+  }
+  const data = (await res.json()) as { object?: { sha?: string } };
+  return data.object?.sha ?? null;
+}
+
+export async function ensureDraftsBranchExists(
+  settings: GitHubSettings
+): Promise<string> {
+  validateSettings(settings);
+  const { draftsBranch } = getDraftsConfig(settings);
+
+  const existingSha = await getBranchHeadSha(settings, draftsBranch);
+  if (existingSha) return existingSha;
+
+  const owner = encodeURIComponent(settings.owner.trim());
+  const repo = encodeURIComponent(settings.repo.trim());
+
+  let baseSha = await getBranchHeadSha(settings, settings.branch.trim() || 'main');
+  if (!baseSha) {
+    const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+      method: 'GET',
+      headers: buildHeaders(settings.token),
+      cache: 'no-store',
+    });
+    if (!repoRes.ok) {
+      throw await parseGitHubError(
+        repoRes,
+        `Unable to access repository ${settings.owner}/${settings.repo}.`
+      );
+    }
+    const repoData = (await repoRes.json()) as { default_branch?: string };
+    if (repoData.default_branch) {
+      baseSha = await getBranchHeadSha(settings, repoData.default_branch);
+    }
+  }
+
+  if (!baseSha) {
+    throw new GitHubApiError(
+      `Cannot create the "${draftsBranch}" branch because "${settings.branch}" has no initial commit yet.`,
+      422
+    );
+  }
+
+  const createRes = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/refs`,
+    {
+      method: 'POST',
+      headers: {
+        ...buildHeaders(settings.token),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        ref: `refs/heads/${draftsBranch}`,
+        sha: baseSha,
+      }),
+    }
+  );
+
+  if (!createRes.ok) {
+    // Handle concurrent creation cleanly
+    if (createRes.status === 422) {
+      const retrySha = await getBranchHeadSha(settings, draftsBranch);
+      if (retrySha) return retrySha;
+    }
+    throw await parseGitHubError(
+      createRes,
+      `Failed to create "${draftsBranch}" branch on GitHub.`
+    );
+  }
+
+  const created = (await createRes.json()) as { object?: { sha?: string } };
+  return created.object?.sha ?? baseSha;
+}
+
+export interface FetchDraftsResult {
+  drafts: SavedDraft[];
+  sha: string | null;
+  branchExists: boolean;
+}
+
+export async function fetchDraftsFromGitHub(
+  settings: GitHubSettings
+): Promise<FetchDraftsResult> {
+  validateSettings(settings);
+  const { draftsBranch, draftsPath } = getDraftsConfig(settings);
+
+  const owner = encodeURIComponent(settings.owner.trim());
+  const repo = encodeURIComponent(settings.repo.trim());
+  const path = encodeRepoPath(draftsPath);
+  const branch = encodeURIComponent(draftsBranch);
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${branch}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: buildHeaders(settings.token),
+    cache: 'no-store',
+  });
+
+  if (response.status === 404) {
+    const branchSha = await getBranchHeadSha(settings, draftsBranch);
+    return {
+      drafts: [],
+      sha: null,
+      branchExists: Boolean(branchSha),
+    };
+  }
+
+  if (!response.ok) {
+    throw await parseGitHubError(
+      response,
+      `Failed to fetch ${draftsPath} from branch "${draftsBranch}" (HTTP ${response.status}).`
+    );
+  }
+
+  const data = (await response.json()) as {
+    content?: string;
+    sha?: string;
+  };
+
+  if (!data.content) {
+    return { drafts: [], sha: data.sha ?? null, branchExists: true };
+  }
+
+  const decodedText = base64ToUtf8(data.content);
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(decodedText.trim() || '[]');
+  } catch {
+    throw new GitHubApiError(
+      `${draftsPath} on branch "${draftsBranch}" does not contain valid JSON.`,
+      422
+    );
+  }
+
+  if (!Array.isArray(parsedJson)) {
+    throw new GitHubApiError(
+      `${draftsPath} on branch "${draftsBranch}" must contain a JSON array.`,
+      422
+    );
+  }
+
+  const drafts = parsedJson
+    .map(normalizeDraftRecord)
+    .filter((item): item is SavedDraft => item !== null);
+
+  return {
+    drafts,
+    sha: data.sha ?? null,
+    branchExists: true,
+  };
+}
+
+async function commitDraftsToGitHub(
+  settings: GitHubSettings,
+  drafts: SavedDraft[],
+  sha: string | null,
+  commitMessage: string
+): Promise<{ sha: string; drafts: SavedDraft[] }> {
+  const { draftsBranch, draftsPath } = getDraftsConfig(settings);
+  const owner = encodeURIComponent(settings.owner.trim());
+  const repo = encodeURIComponent(settings.repo.trim());
+  const path = encodeRepoPath(draftsPath);
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+
+  const serializedJson = JSON.stringify(drafts, null, 2) + '\n';
+  const encodedContent = utf8ToBase64(serializedJson);
+
+  const body: Record<string, string> = {
+    message: commitMessage,
+    content: encodedContent,
+    branch: draftsBranch,
+  };
+  if (sha) {
+    body.sha = sha;
+  }
+
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      ...buildHeaders(settings.token),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw await parseGitHubError(
+      response,
+      `Failed to commit drafts to ${draftsPath} on branch "${draftsBranch}" (HTTP ${response.status}).`
+    );
+  }
+
+  const result = (await response.json()) as {
+    content?: { sha?: string };
+  };
+
+  return {
+    sha: result.content?.sha ?? sha ?? '',
+    drafts,
+  };
+}
+
+export async function upsertDraftToGitHub(
+  settings: GitHubSettings,
+  draft: SavedDraft
+): Promise<{ drafts: SavedDraft[]; savedDraft: SavedDraft }> {
+  validateSettings(settings);
+  await ensureDraftsBranchExists(settings);
+
+  const run = async (): Promise<{ drafts: SavedDraft[]; savedDraft: SavedDraft }> => {
+    const { drafts: remoteDrafts, sha } = await fetchDraftsFromGitHub(settings);
+    const stamp = new Date().toISOString();
+    const stampedDraft: SavedDraft = {
+      ...draft,
+      activeDraftId: draft.draftId,
+      syncedAt: stamp,
+    };
+
+    const exists = remoteDrafts.some((d) => d.draftId === stampedDraft.draftId);
+    const nextRemote = (
+      exists
+        ? remoteDrafts.map((d) => (d.draftId === stampedDraft.draftId ? stampedDraft : d))
+        : [stampedDraft, ...remoteDrafts]
+    ).sort((a, b) => (Date.parse(b.savedAt) || 0) - (Date.parse(a.savedAt) || 0));
+
+    const title = stampedDraft.title.trim() || 'Untitled Draft';
+    await commitDraftsToGitHub(
+      settings,
+      nextRemote,
+      sha,
+      `Save draft: ${title}`
+    );
+
+    return { drafts: nextRemote, savedDraft: stampedDraft };
+  };
+
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 409) {
+      return await run();
+    }
+    throw err;
+  }
+}
+
+export async function deleteDraftFromGitHub(
+  settings: GitHubSettings,
+  draftId: string,
+  title: string
+): Promise<SavedDraft[]> {
+  validateSettings(settings);
+
+  const run = async (): Promise<SavedDraft[]> => {
+    const { drafts: remoteDrafts, sha, branchExists } = await fetchDraftsFromGitHub(settings);
+    if (!branchExists || !sha) return remoteDrafts;
+
+    const filtered = remoteDrafts.filter((d) => d.draftId !== draftId);
+    if (filtered.length === remoteDrafts.length) {
+      return remoteDrafts;
+    }
+
+    await commitDraftsToGitHub(
+      settings,
+      filtered,
+      sha,
+      `Delete draft: ${title.trim() || 'Untitled Draft'}`
+    );
+    return filtered;
+  };
+
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 409) {
+      return await run();
+    }
+    throw err;
+  }
+}
+
+export async function syncDraftsWithGitHub(
+  settings: GitHubSettings,
+  localDrafts: SavedDraft[],
+  activeDraftId?: string | null
+): Promise<{
+  drafts: SavedDraft[];
+  pushedChanges: boolean;
+}> {
+  validateSettings(settings);
+
+  const run = async (): Promise<{ drafts: SavedDraft[]; pushedChanges: boolean }> => {
+    const { drafts: remoteDrafts, sha, branchExists } =
+      await fetchDraftsFromGitHub(settings);
+
+    const merged = mergeSavedDraftLists(
+      localDrafts,
+      remoteDrafts,
+      branchExists,
+      activeDraftId
+    );
+
+    const remoteMap = new Map(remoteDrafts.map((d) => [d.draftId, d]));
+    const needsPush = merged.some((d) => {
+      const r = remoteMap.get(d.draftId);
+      if (!r) return true;
+      return (Date.parse(d.savedAt) || 0) > (Date.parse(r.savedAt) || 0);
+    });
+
+    if (!needsPush) {
+      return { drafts: merged, pushedChanges: false };
+    }
+
+    await ensureDraftsBranchExists(settings);
+    const stamp = new Date().toISOString();
+    const stampedList = merged.map((d) => ({
+      ...d,
+      syncedAt: d.syncedAt && (Date.parse(d.syncedAt) || 0) >= (Date.parse(d.savedAt) || 0)
+        ? d.syncedAt
+        : stamp,
+    }));
+
+    // Re-fetch sha right before PUT in case branch was just created or updated
+    const latest = await fetchDraftsFromGitHub(settings);
+    await commitDraftsToGitHub(
+      settings,
+      stampedList,
+      latest.sha ?? sha,
+      'Sync drafts'
+    );
+    persistSavedDrafts(stampedList);
+    return { drafts: stampedList, pushedChanges: true };
+  };
+
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 409) {
+      return await run();
+    }
+    throw err;
+  }
+}
+

@@ -3,6 +3,8 @@ export interface GitHubSettings {
   repo: string;
   path: string;
   branch: string;
+  draftsBranch: string;
+  draftsPath: string;
   token: string;
   tokenExpiresAt: string;
   tokenNote: string;
@@ -40,6 +42,7 @@ export interface SavedDraft extends DraftPost {
   draftId: string;
   savedAt: string;
   publishedAt?: string | null;
+  syncedAt?: string | null;
 }
 
 export type PublishStatusType =

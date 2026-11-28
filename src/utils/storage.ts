@@ -10,6 +10,8 @@ export const DEFAULT_GITHUB_SETTINGS: GitHubSettings = {
   repo: 'Project_fibre',
   path: 'src/data/posts.json',
   branch: 'main',
+  draftsBranch: 'drafts',
+  draftsPath: 'src/data/drafts.json',
   token: '',
   tokenExpiresAt: '',
   tokenNote: '',
@@ -21,6 +23,15 @@ export function getTodayDateString(): string {
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const day = String(now.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+export function hasDraftContent(draft: DraftPost): boolean {
+  return Boolean(
+    draft.title.trim() ||
+      draft.summary.trim() ||
+      draft.content.trim() ||
+      draft.categoryTags.trim()
+  );
 }
 
 export function createEmptyDraft(): DraftPost {
@@ -56,6 +67,14 @@ export function loadGitHubSettings(): GitHubSettings {
         typeof parsed.branch === 'string' && parsed.branch.trim()
           ? parsed.branch
           : 'main',
+      draftsBranch:
+        typeof parsed.draftsBranch === 'string' && parsed.draftsBranch.trim()
+          ? parsed.draftsBranch
+          : 'drafts',
+      draftsPath:
+        typeof parsed.draftsPath === 'string' && parsed.draftsPath.trim()
+          ? parsed.draftsPath
+          : 'src/data/drafts.json',
       token: typeof parsed.token === 'string' ? parsed.token : '',
       tokenExpiresAt:
         typeof parsed.tokenExpiresAt === 'string' ? parsed.tokenExpiresAt : '',
@@ -67,7 +86,11 @@ export function loadGitHubSettings(): GitHubSettings {
 }
 
 export function saveGitHubSettings(settings: GitHubSettings): void {
-  window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  try {
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // Ignore storage quota errors
+  }
 }
 
 export function loadDraftPost(): DraftPost {
@@ -101,7 +124,11 @@ export function loadDraftPost(): DraftPost {
 }
 
 export function saveDraftPost(draft: DraftPost): void {
-  window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+  try {
+    window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+  } catch {
+    // Ignore storage quota errors
+  }
 }
 
 export function loadSavedDrafts(): SavedDraft[] {
@@ -137,6 +164,8 @@ export function loadSavedDrafts(): SavedDraft[] {
             : new Date().toISOString(),
         publishedAt:
           typeof item.publishedAt === 'string' ? item.publishedAt : null,
+        syncedAt:
+          typeof item.syncedAt === 'string' ? item.syncedAt : null,
         extraFields:
           item.extraFields && typeof item.extraFields === 'object'
             ? item.extraFields
@@ -147,11 +176,18 @@ export function loadSavedDrafts(): SavedDraft[] {
   }
 }
 
-function persistSavedDrafts(drafts: SavedDraft[]): void {
-  window.localStorage.setItem(SAVED_DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
+export function persistSavedDrafts(drafts: SavedDraft[]): void {
+  try {
+    window.localStorage.setItem(SAVED_DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
+  } catch {
+    // Ignore storage quota errors
+  }
 }
 
-export function upsertSavedDraft(draft: DraftPost): {
+export function upsertSavedDraft(
+  draft: DraftPost,
+  options?: { syncedAt?: string | null }
+): {
   drafts: SavedDraft[];
   saved: SavedDraft;
 } {
@@ -160,7 +196,7 @@ export function upsertSavedDraft(draft: DraftPost): {
     draft.activeDraftId ||
     (typeof crypto !== 'undefined' && crypto.randomUUID
       ? crypto.randomUUID()
-      : `draft-${Date.now()}`);
+      : `draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   const nowIso = new Date().toISOString();
 
   const existingItem = existing.find((item) => item.draftId === targetId);
@@ -178,6 +214,10 @@ export function upsertSavedDraft(draft: DraftPost): {
     extraFields: draft.extraFields,
     savedAt: nowIso,
     publishedAt: existingItem?.publishedAt ?? null,
+    syncedAt:
+      options && 'syncedAt' in options
+        ? options.syncedAt ?? null
+        : existingItem?.syncedAt ?? null,
   };
 
   const next = existingItem
@@ -212,6 +252,73 @@ export function markSavedDraftPublished(
   );
   persistSavedDrafts(next);
   return next;
+}
+
+export function markSavedDraftSynced(
+  draftId: string,
+  syncedAtIso?: string
+): SavedDraft[] {
+  const existing = loadSavedDrafts();
+  const stamp = syncedAtIso || new Date().toISOString();
+  const next = existing.map((item) =>
+    item.draftId === draftId
+      ? {
+          ...item,
+          syncedAt: stamp,
+        }
+      : item
+  );
+  persistSavedDrafts(next);
+  return next;
+}
+
+export function mergeSavedDraftLists(
+  localDrafts: SavedDraft[],
+  remoteDrafts: SavedDraft[],
+  remoteBranchExists: boolean,
+  activeDraftId?: string | null
+): SavedDraft[] {
+  const remoteMap = new Map<string, SavedDraft>();
+  for (const r of remoteDrafts) {
+    remoteMap.set(r.draftId, {
+      ...r,
+      syncedAt: r.syncedAt || r.savedAt,
+    });
+  }
+
+  const mergedMap = new Map<string, SavedDraft>();
+
+  for (const l of localDrafts) {
+    const r = remoteMap.get(l.draftId);
+    if (r) {
+      const lTime = Date.parse(l.savedAt) || 0;
+      const rTime = Date.parse(r.savedAt) || 0;
+      mergedMap.set(l.draftId, rTime >= lTime ? r : l);
+      remoteMap.delete(l.draftId);
+    } else {
+      const wasPreviouslySynced = Boolean(l.syncedAt);
+      const hasUnsyncedLocalEdits =
+        l.draftId === activeDraftId &&
+        wasPreviouslySynced &&
+        (Date.parse(l.savedAt) || 0) > (Date.parse(l.syncedAt || '') || 0);
+
+      // If remote branch exists, previously-synced drafts missing from remote were deleted on another device
+      if (!remoteBranchExists || !wasPreviouslySynced || hasUnsyncedLocalEdits) {
+        mergedMap.set(l.draftId, l);
+      }
+    }
+  }
+
+  for (const r of remoteMap.values()) {
+    mergedMap.set(r.draftId, r);
+  }
+
+  const merged = Array.from(mergedMap.values()).sort(
+    (a, b) => (Date.parse(b.savedAt) || 0) - (Date.parse(a.savedAt) || 0)
+  );
+
+  persistSavedDrafts(merged);
+  return merged;
 }
 
 export function loadRemoveDraftOnPublishPref(): boolean {

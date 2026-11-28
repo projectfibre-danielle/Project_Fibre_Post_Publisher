@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Bookmark, Columns2, Eye, PenLine, RotateCcw, Send } from 'lucide-react';
 import { DraftsDrawer } from './components/DraftsDrawer';
 import { MarkdownPreview } from './components/MarkdownPreview';
@@ -14,19 +14,24 @@ import {
   SavedDraft,
 } from './types/blog';
 import {
+  deleteDraftFromGitHub,
   deletePostFromGitHub,
   fetchPostsFromGitHub,
   GitHubApiError,
   publishPostToGitHub,
+  syncDraftsWithGitHub,
+  upsertDraftToGitHub,
 } from './utils/github';
 import {
   createEmptyDraft,
   deleteSavedDraftById,
+  hasDraftContent,
   loadDraftPost,
   loadGitHubSettings,
   loadRemoveDraftOnPublishPref,
   loadSavedDrafts,
   markSavedDraftPublished,
+  markSavedDraftSynced,
   saveDraftPost,
   saveGitHubSettings,
   saveRemoveDraftOnPublishPref,
@@ -36,13 +41,45 @@ import {
 
 type WorkspacePane = 'split' | 'editor' | 'preview';
 
+function getRemoteSnapshotKey(draft: DraftPost): string {
+  return JSON.stringify({
+    editingId: draft.editingId,
+    title: draft.title,
+    slug: draft.slug,
+    date: draft.date,
+    categoryTags: draft.categoryTags,
+    summary: draft.summary,
+    content: draft.content,
+  });
+}
+
 export default function App() {
   const [settings, setSettings] = useState<GitHubSettings>(() =>
     loadGitHubSettings()
   );
-  const [draft, setDraft] = useState<DraftPost>(() => loadDraftPost());
+
+  // Recover any pre-existing unsaved draft into multi-draft storage on initial load
+  const initialBootstrap = useMemo(() => {
+    const initialDraft = loadDraftPost();
+    if (
+      hasDraftContent(initialDraft) &&
+      !initialDraft.editingId &&
+      !initialDraft.activeDraftId
+    ) {
+      const { drafts, saved } = upsertSavedDraft(initialDraft);
+      const linkedDraft: DraftPost = {
+        ...initialDraft,
+        activeDraftId: saved.draftId,
+      };
+      saveDraftPost(linkedDraft);
+      return { draft: linkedDraft, savedDrafts: drafts };
+    }
+    return { draft: initialDraft, savedDrafts: loadSavedDrafts() };
+  }, []);
+
+  const [draft, setDraft] = useState<DraftPost>(() => initialBootstrap.draft);
   const [slugTouched, setSlugTouched] = useState<boolean>(() => {
-    const initial = loadDraftPost();
+    const initial = initialBootstrap.draft;
     return Boolean(initial.slug && initial.slug !== slugify(initial.title));
   });
 
@@ -54,8 +91,8 @@ export default function App() {
   const [postsDrawerOpen, setPostsDrawerOpen] = useState(false);
   const [draftsDrawerOpen, setDraftsDrawerOpen] = useState(false);
 
-  const [savedDrafts, setSavedDrafts] = useState<SavedDraft[]>(() =>
-    loadSavedDrafts()
+  const [savedDrafts, setSavedDrafts] = useState<SavedDraft[]>(
+    () => initialBootstrap.savedDrafts
   );
   const [removeDraftOnPublish, setRemoveDraftOnPublish] = useState<boolean>(() =>
     loadRemoveDraftOnPublishPref()
@@ -66,20 +103,171 @@ export default function App() {
   const [hasLoadedPosts, setHasLoadedPosts] = useState(false);
 
   const [publishing, setPublishing] = useState(false);
+  const [savingDraftRemote, setSavingDraftRemote] = useState(false);
+  const [syncingDrafts, setSyncingDrafts] = useState(false);
   const [status, setStatus] = useState<PublishStatus>({
     type: 'idle',
     title: '',
     message: '',
   });
 
-  // Persist draft in localStorage as the author writes
+  const latestDraftRef = useRef<DraftPost>(draft);
+  latestDraftRef.current = draft;
+  const autoSaveTimerRef = useRef<number | null>(null);
+  const suppressAutoSaveRef = useRef<boolean>(false);
+  const loadedRemoteSnapshotRef = useRef<string | null>(
+    draft.editingId && !draft.activeDraftId ? getRemoteSnapshotKey(draft) : null
+  );
+
+  const shouldAutoSaveDraft = useCallback((target: DraftPost): boolean => {
+    if (suppressAutoSaveRef.current) return false;
+    if (!hasDraftContent(target)) return false;
+    if (
+      target.editingId &&
+      !target.activeDraftId &&
+      loadedRemoteSnapshotRef.current === getRemoteSnapshotKey(target)
+    ) {
+      return false;
+    }
+    return true;
+  }, []);
+
+  const flushDraftToSavedList = useCallback(
+    (target: DraftPost): SavedDraft | null => {
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+      if (!shouldAutoSaveDraft(target)) return null;
+      const { drafts, saved } = upsertSavedDraft(target);
+      setSavedDrafts(drafts);
+      return saved;
+    },
+    [shouldAutoSaveDraft]
+  );
+
+  const updateDraft = useCallback(
+    (updater: (prev: DraftPost) => DraftPost) => {
+      suppressAutoSaveRef.current = false;
+      setDraft(updater);
+    },
+    []
+  );
+
+  // Persist active draft buffer immediately and auto-save into multi-draft storage
   useEffect(() => {
     saveDraftPost(draft);
-  }, [draft]);
+
+    if (autoSaveTimerRef.current !== null) {
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+
+    if (!shouldAutoSaveDraft(draft)) return;
+
+    autoSaveTimerRef.current = window.setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      const current = latestDraftRef.current;
+      if (!shouldAutoSaveDraft(current)) return;
+      const { drafts, saved } = upsertSavedDraft(current);
+      setSavedDrafts(drafts);
+      if (!current.activeDraftId) {
+        setDraft((prev) =>
+          prev.activeDraftId ? prev : { ...prev, activeDraftId: saved.draftId }
+        );
+      }
+    }, 350);
+
+    return () => {
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+    };
+  }, [draft, shouldAutoSaveDraft]);
+
+  // Flush pending draft edits if the browser tab is closed or refreshed
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      const current = latestDraftRef.current;
+      saveDraftPost(current);
+      if (shouldAutoSaveDraft(current)) {
+        const { saved } = upsertSavedDraft(current);
+        if (!current.activeDraftId) {
+          saveDraftPost({ ...current, activeDraftId: saved.draftId });
+        }
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [shouldAutoSaveDraft]);
+
+  const syncRemoteDrafts = useCallback(
+    async (
+      targetSettings: GitHubSettings,
+      options?: { showFeedback?: boolean }
+    ) => {
+      if (!targetSettings.owner.trim() || !targetSettings.token.trim()) return;
+      setSyncingDrafts(true);
+      try {
+        const { drafts } = await syncDraftsWithGitHub(
+          targetSettings,
+          loadSavedDrafts(),
+          latestDraftRef.current.activeDraftId
+        );
+        setSavedDrafts(drafts);
+        if (options?.showFeedback) {
+          const branchName = targetSettings.draftsBranch?.trim() || 'drafts';
+          setStatus({
+            type: 'success',
+            title: `Synced ${drafts.length} draft${drafts.length === 1 ? '' : 's'} with GitHub`,
+            message: `Loaded and merged drafts from "${branchName}" branch (${targetSettings.draftsPath || 'src/data/drafts.json'}).`,
+          });
+        }
+      } catch (err) {
+        if (err instanceof GitHubApiError && err.isAuthError) {
+          setStatus({
+            type: 'auth_error',
+            title:
+              err.status === 401
+                ? 'GitHub Token Unauthorized or Expired'
+                : 'GitHub Access Forbidden or Missing Scope',
+            message: err.message,
+            httpStatus: err.status,
+          });
+        } else if (options?.showFeedback) {
+          setStatus({
+            type: 'error',
+            title: 'Could not sync drafts with GitHub',
+            message:
+              err instanceof Error
+                ? err.message
+                : 'Network error while syncing drafts branch.',
+          });
+        }
+      } finally {
+        setSyncingDrafts(false);
+      }
+    },
+    []
+  );
+
+  // Sync drafts from the GitHub drafts branch once on startup when configured
+  const didInitialDraftSyncRef = useRef(false);
+  useEffect(() => {
+    if (didInitialDraftSyncRef.current) return;
+    didInitialDraftSyncRef.current = true;
+    if (settings.owner.trim() && settings.token.trim()) {
+      void syncRemoteDrafts(settings, { showFeedback: false });
+    }
+  }, [settings, syncRemoteDrafts]);
 
   const handleSaveSettings = (next: GitHubSettings) => {
     setSettings(next);
     saveGitHubSettings(next);
+    if (next.owner.trim() && next.token.trim()) {
+      void syncRemoteDrafts(next, { showFeedback: false });
+    }
   };
 
   const handleAuthError = (httpStatus: number, detail: string) => {
@@ -140,6 +328,18 @@ export default function App() {
   };
 
   const handleSelectPostForEdit = (post: BlogPost) => {
+    const preserved = flushDraftToSavedList(latestDraftRef.current);
+    if (preserved && settings.owner.trim() && settings.token.trim()) {
+      void upsertDraftToGitHub(settings, preserved)
+        .then(({ savedDraft }) => {
+          setSavedDrafts(markSavedDraftSynced(preserved.draftId, savedDraft.syncedAt ?? undefined));
+        })
+        .catch(() => {
+          // Local draft copy remains safely preserved
+        });
+    }
+    suppressAutoSaveRef.current = false;
+
     const knownKeys = new Set([
       'id',
       'slug',
@@ -160,7 +360,7 @@ export default function App() {
       }
     }
 
-    setDraft({
+    const nextDraft: DraftPost = {
       activeDraftId: null,
       editingId: post.id,
       title: post.title,
@@ -172,7 +372,10 @@ export default function App() {
       content: post.content,
       createdAt: post.createdAt ?? null,
       extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
-    });
+    };
+
+    loadedRemoteSnapshotRef.current = getRemoteSnapshotKey(nextDraft);
+    setDraft(nextDraft);
     setSlugTouched(true);
     setSyncVersion((v) => v + 1);
     setStatus({
@@ -242,38 +445,126 @@ export default function App() {
     }
   };
 
+  const pushDraftInBackground = (saved: SavedDraft) => {
+    if (!settings.owner.trim() || !settings.token.trim()) return;
+    void upsertDraftToGitHub(settings, saved)
+      .then(({ savedDraft }) => {
+        setSavedDrafts(markSavedDraftSynced(saved.draftId, savedDraft.syncedAt ?? undefined));
+      })
+      .catch(() => {
+        // Preserved locally; user can manually click Sync in Drafts drawer
+      });
+  };
+
   const handleNewDraft = () => {
+    const preserved = flushDraftToSavedList(latestDraftRef.current);
+    if (preserved) {
+      pushDraftInBackground(preserved);
+    }
+    suppressAutoSaveRef.current = false;
+    loadedRemoteSnapshotRef.current = null;
+
     setDraft(createEmptyDraft());
     setSlugTouched(false);
     setSyncVersion((v) => v + 1);
-    setStatus({ type: 'idle', title: '', message: '' });
+
+    const hasGitHub = Boolean(settings.owner.trim() && settings.token.trim());
+    if (preserved) {
+      setStatus({
+        type: 'success',
+        title: 'Started a new draft',
+        message: hasGitHub
+          ? `Saved "${preserved.title.trim() || 'Untitled Draft'}" to Drafts and syncing to GitHub's "${settings.draftsBranch || 'drafts'}" branch.`
+          : `Saved "${preserved.title.trim() || 'Untitled Draft'}" to your local Drafts list so you can return to it anytime.`,
+      });
+    } else {
+      setStatus({ type: 'idle', title: '', message: '' });
+    }
   };
 
-  const handleSaveDraftLocally = () => {
-    if (!draft.title.trim() && !draft.content.trim() && !draft.summary.trim()) {
+  const handleSaveDraft = async () => {
+    const current = latestDraftRef.current;
+    if (!hasDraftContent(current)) {
       setStatus({
         type: 'error',
         title: 'Nothing to save yet',
-        message: 'Add a title, summary, or post content before saving a local draft.',
+        message: 'Add a title, summary, or post content before saving a draft.',
       });
       return;
     }
 
-    const { drafts, saved } = upsertSavedDraft(draft);
+    if (autoSaveTimerRef.current !== null) {
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    suppressAutoSaveRef.current = false;
+
+    const { drafts, saved } = upsertSavedDraft(current);
     setSavedDrafts(drafts);
     setDraft((prev) => ({
       ...prev,
       activeDraftId: saved.draftId,
     }));
 
+    const draftLabel = saved.title.trim() || 'Untitled Draft';
+    if (!settings.owner.trim() || !settings.token.trim()) {
+      setStatus({
+        type: 'success',
+        title: `Saved draft "${draftLabel}" locally`,
+        message: 'Stored in browser localStorage. Add your GitHub Owner & Token in Settings to also sync drafts across devices.',
+      });
+      return;
+    }
+
+    const draftsBranch = settings.draftsBranch?.trim() || 'drafts';
+    setSavingDraftRemote(true);
     setStatus({
-      type: 'success',
-      title: `Saved draft "${saved.title.trim() || 'Untitled Draft'}" locally`,
-      message: 'Stored in browser localStorage only. Not published or committed to src/data/posts.json.',
+      type: 'loading',
+      title: `Saving draft "${draftLabel}" to GitHub`,
+      message: `Syncing to ${settings.owner}/${settings.repo} (${draftsBranch} branch)...`,
     });
+
+    try {
+      const { savedDraft } = await upsertDraftToGitHub(settings, saved);
+      const updated = markSavedDraftSynced(
+        saved.draftId,
+        savedDraft.syncedAt ?? undefined
+      );
+      setSavedDrafts(updated);
+      setStatus({
+        type: 'success',
+        title: `Saved draft "${draftLabel}" to GitHub`,
+        message: `Synced to "${draftsBranch}" branch (${settings.draftsPath || 'src/data/drafts.json'}) without touching "${settings.branch}".`,
+      });
+    } catch (err) {
+      if (err instanceof GitHubApiError && err.isAuthError) {
+        handleAuthError(err.status, err.message);
+      } else {
+        setStatus({
+          type: 'error',
+          title: `Saved "${draftLabel}" locally, but GitHub sync failed`,
+          message:
+            err instanceof Error
+              ? err.message
+              : 'Could not reach GitHub drafts branch.',
+        });
+      }
+    } finally {
+      setSavingDraftRemote(false);
+    }
   };
 
   const handleOpenSavedDraft = (saved: SavedDraft) => {
+    const current = latestDraftRef.current;
+    if (current.activeDraftId !== saved.draftId) {
+      const preserved = flushDraftToSavedList(current);
+      if (preserved) {
+        pushDraftInBackground(preserved);
+      }
+    }
+    suppressAutoSaveRef.current = false;
+    loadedRemoteSnapshotRef.current = null;
+
     setDraft({
       activeDraftId: saved.draftId,
       editingId: saved.editingId,
@@ -296,10 +587,25 @@ export default function App() {
   };
 
   const handleDeleteSavedDraft = (draftId: string) => {
+    const existing = savedDrafts.find((d) => d.draftId === draftId);
     const next = deleteSavedDraftById(draftId);
     setSavedDrafts(next);
-    if (draft.activeDraftId === draftId) {
+    if (latestDraftRef.current.activeDraftId === draftId) {
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+      suppressAutoSaveRef.current = true;
       setDraft((prev) => ({ ...prev, activeDraftId: null }));
+    }
+    if (settings.owner.trim() && settings.token.trim()) {
+      void deleteDraftFromGitHub(
+        settings,
+        draftId,
+        existing?.title || 'Untitled Draft'
+      ).catch(() => {
+        // Deleted locally; user can re-sync if needed
+      });
     }
   };
 
@@ -351,26 +657,55 @@ export default function App() {
           const updatedDrafts = deleteSavedDraftById(targetDraft.activeDraftId);
           setSavedDrafts(updatedDrafts);
           nextActiveDraftId = null;
+          void deleteDraftFromGitHub(
+            settings,
+            targetDraft.activeDraftId,
+            targetDraft.title
+          ).catch(() => {
+            // Non-blocking cleanup on drafts branch
+          });
         } else {
           const updatedDrafts = markSavedDraftPublished(
             targetDraft.activeDraftId,
             savedPost.id
           );
           setSavedDrafts(updatedDrafts);
+          const publishedItem = updatedDrafts.find(
+            (d) => d.draftId === targetDraft.activeDraftId
+          );
+          if (publishedItem) {
+            void upsertDraftToGitHub(settings, publishedItem)
+              .then(({ savedDraft }) => {
+                setSavedDrafts(
+                  markSavedDraftSynced(
+                    publishedItem.draftId,
+                    savedDraft.syncedAt ?? undefined
+                  )
+                );
+              })
+              .catch(() => {
+                // Non-blocking sync on drafts branch
+              });
+          }
         }
       }
 
       if (
-        targetDraft.activeDraftId === draft.activeDraftId ||
-        targetDraft === draft
+        targetDraft === draft ||
+        (Boolean(targetDraft.activeDraftId) &&
+          targetDraft.activeDraftId === draft.activeDraftId)
       ) {
-        setDraft((prev) => ({
-          ...prev,
+        const nextActiveDraft: DraftPost = {
+          ...draft,
           activeDraftId: nextActiveDraftId,
           editingId: savedPost.id,
           slug: savedPost.slug,
           createdAt: savedPost.createdAt ?? null,
-        }));
+        };
+        loadedRemoteSnapshotRef.current = !nextActiveDraftId
+          ? getRemoteSnapshotKey(nextActiveDraft)
+          : null;
+        setDraft(nextActiveDraft);
         setSlugTouched(true);
       }
 
@@ -555,9 +890,13 @@ export default function App() {
             {draft.activeDraftId && !draft.editingId && (
               <>
                 <span aria-hidden="true">·</span>
-                <span className="font-medium text-[#2d1f3d]">
-                  Local draft
-                </span>
+                <button
+                  type="button"
+                  onClick={() => setDraftsDrawerOpen(true)}
+                  className="font-medium text-[#2d1f3d] hover:underline underline-offset-4"
+                >
+                  Auto-saved in Drafts
+                </button>
               </>
             )}
 
@@ -582,11 +921,12 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
-              onClick={handleSaveDraftLocally}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs font-medium text-[#18181B] transition-colors hover:bg-[#F4F4F5] whitespace-nowrap shrink-0"
+              onClick={() => void handleSaveDraft()}
+              disabled={savingDraftRemote}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[#E4E4E7] bg-white px-3 py-1.5 text-xs font-medium text-[#18181B] transition-colors hover:bg-[#F4F4F5] disabled:opacity-60 whitespace-nowrap shrink-0"
             >
               <Bookmark className="h-3.5 w-3.5 text-[#52525B]" />
-              Save Draft
+              {savingDraftRemote ? 'Saving Draft...' : 'Save Draft'}
             </button>
             <button
               type="button"
@@ -683,7 +1023,7 @@ export default function App() {
                       value={draft.title}
                       onChange={(e) => {
                         const nextTitle = e.target.value;
-                        setDraft((prev) => ({
+                        updateDraft((prev) => ({
                           ...prev,
                           title: nextTitle,
                           slug: slugTouched ? prev.slug : slugify(nextTitle),
@@ -707,7 +1047,7 @@ export default function App() {
                         type="date"
                         value={draft.date}
                         onChange={(e) =>
-                          setDraft((prev) => ({ ...prev, date: e.target.value }))
+                          updateDraft((prev) => ({ ...prev, date: e.target.value }))
                         }
                         className="w-full rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-1.5 text-sm text-[#18181B] tabular-nums focus:border-[#2563EB] focus:bg-white focus:outline-none"
                       />
@@ -725,7 +1065,7 @@ export default function App() {
                         type="text"
                         value={draft.categoryTags}
                         onChange={(e) =>
-                          setDraft((prev) => ({
+                          updateDraft((prev) => ({
                             ...prev,
                             categoryTags: e.target.value,
                           }))
@@ -748,7 +1088,7 @@ export default function App() {
                         value={draft.slug}
                         onChange={(e) => {
                           setSlugTouched(true);
-                          setDraft((prev) => ({
+                          updateDraft((prev) => ({
                             ...prev,
                             slug: e.target.value,
                           }));
@@ -771,7 +1111,7 @@ export default function App() {
                       rows={2}
                       value={draft.summary}
                       onChange={(e) =>
-                        setDraft((prev) => ({ ...prev, summary: e.target.value }))
+                        updateDraft((prev) => ({ ...prev, summary: e.target.value }))
                       }
                       placeholder="Write a concise 1–2 sentence summary for the Project Fibre index..."
                       className="w-full resize-none rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 text-sm leading-relaxed text-[#18181B] placeholder:text-[#A1A1AA] focus:border-[#2563EB] focus:bg-white focus:outline-none"
@@ -784,7 +1124,7 @@ export default function App() {
               <RichTextEditor
                 value={draft.content}
                 onChange={(nextContent) =>
-                  setDraft((prev) => ({ ...prev, content: nextContent }))
+                  updateDraft((prev) => ({ ...prev, content: nextContent }))
                 }
                 editorMode={editorMode}
                 onEditorModeChange={setEditorMode}
@@ -831,15 +1171,21 @@ export default function App() {
         onAuthErrorDetected={handleAuthError}
       />
 
-      {/* Local Drafts Drawer */}
+      {/* Drafts Drawer */}
       <DraftsDrawer
         isOpen={draftsDrawerOpen}
         onClose={() => setDraftsDrawerOpen(false)}
         drafts={savedDrafts}
         activeDraftId={draft.activeDraftId ?? null}
         removeDraftOnPublish={removeDraftOnPublish}
+        isConfigured={isConfigured}
+        draftsBranch={settings.draftsBranch || 'drafts'}
+        syncingDrafts={syncingDrafts}
+        onSyncDrafts={() => syncRemoteDrafts(settings, { showFeedback: true })}
+        onOpenSettings={() => setSettingsOpen(true)}
         onToggleRemoveOnPublish={handleToggleRemoveOnPublish}
         onOpenDraft={handleOpenSavedDraft}
+        onNewDraft={handleNewDraft}
         onPublishDraft={publishDraftPayload}
         onDeleteDraft={handleDeleteSavedDraft}
       />

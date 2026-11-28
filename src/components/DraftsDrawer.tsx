@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { FolderOpen, Search, Send, Trash2, X } from 'lucide-react';
+import { FolderOpen, Plus, RefreshCw, Search, Send, Trash2, X } from 'lucide-react';
 import { SavedDraft } from '../types/blog';
 
 interface DraftsDrawerProps {
@@ -8,8 +8,14 @@ interface DraftsDrawerProps {
   drafts: SavedDraft[];
   activeDraftId: string | null;
   removeDraftOnPublish: boolean;
+  isConfigured: boolean;
+  draftsBranch: string;
+  syncingDrafts: boolean;
+  onSyncDrafts: () => Promise<void>;
+  onOpenSettings: () => void;
   onToggleRemoveOnPublish: (next: boolean) => void;
   onOpenDraft: (draft: SavedDraft) => void;
+  onNewDraft: () => void;
   onPublishDraft: (draft: SavedDraft) => Promise<void>;
   onDeleteDraft: (draftId: string) => void;
 }
@@ -31,8 +37,14 @@ export const DraftsDrawer: React.FC<DraftsDrawerProps> = ({
   drafts,
   activeDraftId,
   removeDraftOnPublish,
+  isConfigured,
+  draftsBranch,
+  syncingDrafts,
+  onSyncDrafts,
+  onOpenSettings,
   onToggleRemoveOnPublish,
   onOpenDraft,
+  onNewDraft,
   onPublishDraft,
   onDeleteDraft,
 }) => {
@@ -92,26 +104,70 @@ export const DraftsDrawer: React.FC<DraftsDrawerProps> = ({
         className="flex h-full w-full max-w-xl flex-col border-l border-[#E4E4E7] bg-white shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between border-b border-[#E4E4E7] px-6 py-4">
-          <div>
+        <div className="flex items-center justify-between gap-3 border-b border-[#E4E4E7] px-6 py-4">
+          <div className="min-w-0">
             <h2
               id="drafts-drawer-title"
               className="font-serif text-xl font-semibold text-[#18181B]"
             >
-              Local Drafts
+              Drafts
             </h2>
             <p className="mt-0.5 text-xs text-[#71717A] tabular-nums">
-              {drafts.length} saved in browser localStorage · never committed until published
+              {drafts.length} draft{drafts.length === 1 ? '' : 's'} ·{' '}
+              {isConfigured ? (
+                <>
+                  synced with GitHub <span className="font-mono text-[#3F3F46]">{draftsBranch || 'drafts'}</span> branch
+                </>
+              ) : (
+                <>
+                  saved in browser only ·{' '}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenSettings();
+                    }}
+                    className="font-medium text-[#2563EB] underline underline-offset-2"
+                  >
+                    Connect GitHub to sync across devices
+                  </button>
+                </>
+              )}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close Drafts Drawer"
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-[#52525B] transition-colors hover:bg-[#F4F4F5] hover:text-[#18181B]"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {isConfigured && (
+              <button
+                type="button"
+                disabled={syncingDrafts}
+                onClick={() => void onSyncDrafts()}
+                title={`Sync drafts with GitHub "${draftsBranch || 'drafts'}" branch`}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs font-medium text-[#18181B] transition-colors hover:bg-[#F4F4F5] disabled:opacity-50 whitespace-nowrap shrink-0"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${syncingDrafts ? 'animate-spin' : ''}`} />
+                {syncingDrafts ? 'Syncing...' : 'Sync'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                onNewDraft();
+                onClose();
+              }}
+              className="inline-flex items-center gap-1 rounded-lg border border-[#E4E4E7] bg-white px-2.5 py-1.5 text-xs font-medium text-[#18181B] transition-colors hover:bg-[#F4F4F5] whitespace-nowrap shrink-0"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              New Draft
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close Drafts Drawer"
+              className="flex h-9 w-9 items-center justify-center rounded-lg text-[#52525B] transition-colors hover:bg-[#F4F4F5] hover:text-[#18181B]"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         <div className="space-y-3 border-b border-[#E4E4E7] bg-[#FAFAFA] px-6 py-3">
@@ -142,7 +198,7 @@ export const DraftsDrawer: React.FC<DraftsDrawerProps> = ({
             <div className="rounded-xl border border-[#E4E4E7] bg-[#FAFAFA] p-6 text-center">
               <p className="text-sm text-[#52525B]">
                 {drafts.length === 0
-                  ? 'No saved drafts yet. Click Save Draft in the editor to keep work-in-progress posts locally without publishing.'
+                  ? 'No saved drafts yet. Start writing in the editor or click Save Draft — your drafts are kept locally here even when you start a new draft.'
                   : 'No drafts match your search filter.'}
               </p>
             </div>
@@ -178,6 +234,13 @@ export const DraftsDrawer: React.FC<DraftsDrawerProps> = ({
                               <span>Unpublished</span>
                             </>
                           )}
+                          <span aria-hidden="true">·</span>
+                          <span>
+                            {draft.syncedAt &&
+                            (Date.parse(draft.syncedAt) || 0) >= (Date.parse(draft.savedAt) || 0)
+                              ? 'Synced to GitHub'
+                              : 'Local changes'}
+                          </span>
                           {isActive && (
                             <>
                               <span aria-hidden="true">·</span>

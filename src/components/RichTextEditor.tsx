@@ -213,6 +213,7 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
   const savedRangeRef = useRef<Range | null>(null);
   const savedRawSelectionRef = useRef<{ start: number; end: number } | null>(null);
   const lastEmittedRef = useRef<string>(value);
+  const lastSyncVersionRef = useRef<number>(syncVersion);
 
   const [activePopover, setActivePopover] = useState<ActivePopover>('none');
 
@@ -238,8 +239,14 @@ export const RichTextEditor: React.FC<RichTextEditorProps> = ({
 
   // Hydrate rich text surface when switching into rich mode or loading a new draft/post
   useEffect(() => {
+    const syncChanged = syncVersion !== lastSyncVersionRef.current;
+    lastSyncVersionRef.current = syncVersion;
     if (editorMode === 'rich' && richRef.current) {
-      if (value !== lastEmittedRef.current || richRef.current.innerHTML === '') {
+      if (
+        syncChanged ||
+        value !== lastEmittedRef.current ||
+        richRef.current.innerHTML === ''
+      ) {
         richRef.current.innerHTML = markdownToSafeHtml(value);
         lastEmittedRef.current = value;
       }

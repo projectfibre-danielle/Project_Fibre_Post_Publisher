@@ -97,6 +97,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       repo: form.repo.trim() || 'Project_fibre',
       path: form.path.trim() || 'src/data/posts.json',
       branch: form.branch.trim() || 'main',
+      draftsBranch: form.draftsBranch.trim() || 'drafts',
+      draftsPath: form.draftsPath.trim() || 'src/data/drafts.json',
       token: form.token.trim(),
       tokenExpiresAt: form.tokenExpiresAt,
       tokenNote: form.tokenNote.trim(),
@@ -126,6 +128,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         repo: form.repo.trim() || 'Project_fibre',
         path: form.path.trim() || 'src/data/posts.json',
         branch: form.branch.trim() || 'main',
+        draftsBranch: form.draftsBranch.trim() || 'drafts',
+        draftsPath: form.draftsPath.trim() || 'src/data/drafts.json',
         token: form.token.trim(),
       };
       onSave(cleaned);
@@ -257,7 +261,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   htmlFor="github-branch-input"
                   className="mb-1.5 block text-xs font-medium text-[#3F3F46]"
                 >
-                  Branch
+                  Published Branch
                 </label>
                 <input
                   id="github-branch-input"
@@ -270,6 +274,47 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 />
               </div>
             </div>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div className="sm:col-span-2">
+                <label
+                  htmlFor="github-drafts-path-input"
+                  className="mb-1.5 block text-xs font-medium text-[#3F3F46]"
+                >
+                  Drafts JSON File Path
+                </label>
+                <input
+                  id="github-drafts-path-input"
+                  type="text"
+                  required
+                  value={form.draftsPath}
+                  onChange={(e) => setForm({ ...form, draftsPath: e.target.value })}
+                  placeholder="src/data/drafts.json"
+                  className="w-full rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 font-mono text-xs text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="github-drafts-branch-input"
+                  className="mb-1.5 block text-xs font-medium text-[#3F3F46]"
+                >
+                  Drafts Branch
+                </label>
+                <input
+                  id="github-drafts-branch-input"
+                  type="text"
+                  required
+                  value={form.draftsBranch}
+                  onChange={(e) => setForm({ ...form, draftsBranch: e.target.value })}
+                  placeholder="drafts"
+                  className="w-full rounded-lg border border-[#E4E4E7] bg-[#FAFAFA] px-3 py-2 font-mono text-xs text-[#18181B] focus:border-[#2563EB] focus:bg-white focus:outline-none"
+                />
+              </div>
+            </div>
+            <p className="text-[12px] leading-relaxed text-[#71717A]">
+              Unpublished drafts sync to the separate <span className="font-mono text-[#3F3F46]">{form.draftsBranch || 'drafts'}</span> branch (auto-created if missing) so your <span className="font-mono text-[#3F3F46]">{form.branch || 'main'}</span> blog stays untouched until you publish.
+            </p>
 
             {/* Fine-grained PAT */}
             <div className="border-t border-[#E4E4E7] pt-4">
